@@ -1135,10 +1135,10 @@
                                                                 [((out ...) MLo (in ...))
                                                                  (with-syntax ([[((iid eid)) ...] (map normalize-init/field (syntax->list #'(out ...)))])
                                                                    #`(begin #,@(map (lambda (this-iid)
-                                                                                      (let ((replaced-iids) (map (lambda (id) (if (free-identifier=? id this-iid)
+                                                                                      (let ((replaced-iids (map (lambda (id) (if (free-identifier=? id this-iid)
                                                                                                                                   #'(unbox val)
                                                                                                                                   #`((#,id 'get))))
-                                                                                                                 (syntax->list #'(iid ...))))
+                                                                                                                 (syntax->list #'(iid ...)))))
                                                                                         #`(set! #,this-iid
                                                                                                 (field-initialization-value
                                                                                                  (let ((val (box #f))
