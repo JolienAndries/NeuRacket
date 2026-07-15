@@ -95,7 +95,7 @@
               public-final override-final augment-final
               field init init-field init-rest
               neural-field abstract-neural-field augment-neural-field override-neural-field
-              external-neural-field
+              external-neural-field begin-train defneuralslice new-neural-slice 
               rename-super rename-inner inherit inherit/super inherit/inner inherit-field
               this this% super inner
               super-make-object super-instantiate super-new
@@ -4609,6 +4609,81 @@ An example
   (unless (symbol? id) (raise-argument-error 'dynamic-set-field! "symbol?" id))
   (do-set-field! 'dynamic-set-field! id obj val))
 
+(define-syntax (set-fields! stx)
+  (syntax-case stx ()
+    
+    [(_ [name ... last-name] [obj ... last-obj] [val ... last-val])
+     (and (andmap identifier? (cons #'last-name (syntax->list #'(name ...))))
+          (= (length (syntax->list #'(name ...)))
+             (length (syntax->list #'(val ...)))))
+     (with-syntax ([(localized ... last-localized)
+                    (map localize (syntax->list #'(name ... last-name)))])
+       (class-syntax-protect
+        (syntax/loc stx
+          (begin
+            (do-set-field-no-trigger! 'set-fields! `localized obj val) ...
+            (set-field!/proc `last-localized last-obj last-val)))))]
+    [(_ [name obj val] ... [last-name last-obj last-val])  
+     (and (andmap identifier? (cons #'last-name (syntax->list #'(name ...))))
+          (= (length (syntax->list #'(name ...)))
+             (length (syntax->list #'(val ...)))))
+     (with-syntax ([(localized ... last-localized)
+                    (map localize (syntax->list #'(name ... last-name)))])
+       (class-syntax-protect
+        (syntax/loc stx
+          (begin
+            (do-set-field-no-trigger! 'set-fields! `localized obj val) ...
+            (set-field!/proc `last-localized last-obj last-val)))))]
+    [(_ [name ... last-name] obj [val ... last-val])
+     (and (andmap identifier? (cons #'last-name (syntax->list #'(name ...))))
+          (= (length (syntax->list #'(name ...)))
+             (length (syntax->list #'(val ...)))))
+     (with-syntax ([(localized ... last-localized)
+                    (map localize (syntax->list #'(name ... last-name)))])
+       (class-syntax-protect
+        (syntax/loc stx
+          (begin
+            (do-set-field-no-trigger! 'set-fields! `localized obj val) ...
+            (set-field!/proc `last-localized obj last-val)))))]
+    [(_ name obj val)
+     (raise-syntax-error
+      'set-field! "expected field names as first argument"
+      stx #'name)]))
+
+(define (do-set-field-no-trigger! who id obj val)
+  (define cls-or-object/c-wrapper-info (object-ref obj #f))
+  (cond
+    [(class? cls-or-object/c-wrapper-info)
+     (do-set-field-no-trigger!/raw-object who cls-or-object/c-wrapper-info id obj val)]
+    [(object/c-wrapper-info? cls-or-object/c-wrapper-info)
+     (define unwrapped (object/c-wrapper-info-val cls-or-object/c-wrapper-info))
+     (define blame+neg-party (object/c-wrapper-info-blame+neg-party cls-or-object/c-wrapper-info))
+     (define neg-party (cdr blame+neg-party))
+     (cond
+       [(hash-ref (object/c-wrapper-info-neg-fields cls-or-object/c-wrapper-info) id #f)
+        =>
+        (λ (lnp)
+          (do-set-field-no-trigger! who id unwrapped (with-contract-continuation-mark
+                                                         blame+neg-party
+                                                       (lnp val neg-party))))]
+       [else
+        (do-opaque-field-mutation-check cls-or-object/c-wrapper-info obj id val)
+        (do-set-field-no-trigger! who id unwrapped val)])]
+    [else
+     (raise-argument-error who
+                           "object?"
+                           obj)]))
+  
+(define (do-set-field-no-trigger!/raw-object who cls id obj val)
+  (define field-ht (class-field-ht cls))
+  (define fi (hash-ref field-ht id #f))
+  (if fi
+      ((field-info-external-no-trigger-set! fi) obj val)
+      (obj-error who
+                 "given object does not have the requested field"
+                 "field name" (as-write id)
+                 "object" obj)))
+
 (define-syntax (get-field stx)
   (syntax-case stx ()
     [(_ name obj)
@@ -5217,6 +5292,50 @@ An example
                                    (send obj equal-secondary-hash-code-of base-hash2-code)))])
               equal-to? equal-hash-code-of equal-secondary-hash-code-of))
 
+(define (new-neural-slice slice . objs)
+  (apply slice objs))
+
+(define-syntax defneuralslice
+  (lambda (stx)
+    (syntax-case stx (using-objects target-fields input-fields MLObject)
+      [(_ (slice-name obj-name ...)
+          [target-fields [target-obj target-field] ...]
+          [input-fields [input-obj input-field] ...]
+          [MLObject MLo])
+
+       #`(define (slice-name obj-name ...)
+           (((access-neural-field! target-field target-obj) 'fill-in-external!) (lambda (msg val changed hold input-prev)
+                                                                                  (define (set-val! new-value)
+                                                                                    (set-box! changed #t)
+                                                                                    (set-box! val new-value))
+                                                                                  (case msg
+                                                                                    [(get)  (lambda ()
+                                                                                              (cond ((and (train-mode) (unbox changed)) (unbox val))
+                                                                                                    ((train-mode) (error "cannot get an unassigned external neural field in train mode"))
+                                                                                                    ((equal? (unbox input-prev) (list (get-field input-field input-obj) ...)) (unbox hold))
+                                                                                                    (else (let-values ([(target-field ...) (send MLo infer (get-field input-field input-obj) ...)])
+                                                                                                            (set-box! input-prev (list (get-field input-field input-obj) ...))
+                                                                                                            (set-box! hold target-field)
+                                                                                                            target-field))))] 
+                                                                                    [(set!) (lambda (new-value)
+                                                                                              (if (train-mode)
+                                                                                                  (begin 
+                                                                                                    (set-val! new-value)
+                                                                                                    (send MLo train (get-field target-field target-obj) ... (get-field input-field input-obj) ...))
+                                                                                                  (error "cannot assign to an external neural field during infer-mode")))]
+                                                                                    [(set-no-trigger!) (lambda (new-value)
+                                                                                                         (if (train-mode)
+                                                                                                             (set-val! new-value)
+                                                                                                             (error "cannot assign to an external neural field during infer-mode")))]
+                                                                                    [else (error "you can only get or set an external-neural-field")])))
+           ...)])))
+
+(define train-mode (make-parameter #f))
+(define-syntax (begin-train stx)
+  (syntax-case stx ()
+    [(_ exp ...)
+     #'(parameterize ([train-mode #t])   exp ...)]))
+
 ;; Providing normal functionality:
 (provide (protect-out get-field/proc)
          
@@ -5240,7 +5359,9 @@ An example
          externalizable<%> printable<%> writable<%> equal<%>
          new make-object instantiate dynamic-instantiate
          get-field set-field! field-bound? field-names
+         set-fields!
          dynamic-get-field dynamic-set-field!
+            set-fields! begin-train defneuralslice new-neural-slice
          send send/apply send/keyword-apply send* send+ dynamic-send
          class-field-accessor class-field-mutator with-method
          private* public*  pubment*
