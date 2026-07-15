@@ -94,7 +94,7 @@
               pubment overment augride
               public-final override-final augment-final
               field init init-field init-rest
-              neural-field
+              neural-field abstract-neural-field
               rename-super rename-inner inherit inherit/super inherit/inner inherit-field
               this this% super inner
               super-make-object super-instantiate super-new
@@ -252,7 +252,8 @@
  [-field field]
  [-init init]
  [-init-field init-field]
- [-neural-field neural-field])
+ [-neural-field neural-field]
+ [-abstract-neural-field abstract-neural-field])
 
 
 (define-for-syntax not-in-a-class
@@ -371,7 +372,8 @@
                 (quote-syntax -field)
                 (quote-syntax -init-field)
                 (quote-syntax -inherit-field)
-                (quote-syntax -neural-field) 
+                (quote-syntax -neural-field)
+                (quote-syntax -abstract-neural-field)
                 (quote-syntax -private)
                 (quote-syntax -public)
                 (quote-syntax -override)
@@ -466,7 +468,7 @@
                                (if (ormap (lambda (i)
                                             (free-identifier=? (car l) i))
                                           (syntax-e (quote-syntax (-init -init-field -field
-                                                                         -neural-field))))
+                                                                         -neural-field -abstract-neural-field))))
                                    (cddr l)
                                    (cdr l)))])
                       (if alone
@@ -555,7 +557,7 @@
             ;; ------ Basic syntax checks -----
             (for-each (lambda (stx)
                         (syntax-case stx (-init -init-rest -field -init-field -inherit-field
-                                                -neural-field
+                                                -neural-field -abstract-neural-field
                                                 -private -public -override -augride
                                                 -public-final -override-final -augment-final
                                                 -pubment -overment -augment
@@ -638,6 +640,21 @@
                                      (syntax->list (syntax (idp ...))))]
                           [(-neural-field orig . rest) 
                            (bad "ill-formed augment-neural-field clause" #'orig)]
+                          [(-abstract-neural-field orig idp ...)
+                           ;; idp ... = [a 1] ... 
+                           (for-each (lambda (idp)
+                                       (syntax-case idp ()
+                                         [(id  [input ...]) (and (identifier? (syntax id))
+                                                                 (andmap (lambda (in) (identifier? (syntax in))) (syntax->list (syntax (input ...))))) 'ok]
+                                         [([id ...]  [input ...]) (and (andmap (lambda (in) (identifier? (syntax in))) (syntax->list (syntax (id ...))))
+                                                                       (andmap (lambda (in) (identifier? (syntax in))) (syntax->list (syntax (input ...))))) 'ok]
+                                         [else
+                                          (bad 
+                                           "abstract-neural-field element is not an optionally renamed identifier-expression pair"
+                                           idp)]))
+                                     (syntax->list (syntax (idp ...))))]
+                          [(-abstract-neural-field orig . rest) 
+                           (bad "ill-formed abstract-neural-field clause" #'orig)]
                           [(-private id ...)
                            (for-each
                             (lambda (id)
@@ -784,6 +801,10 @@
                            (flatten #f (extract* (list (quote-syntax -neural-field)) exprs))]
                           [(normal-plain-neural-fields)   
                            (apply append (map normalize-init/neural-field plain-neural-fields))]
+                          [(plain-abstract-neural-fields)
+                           (flatten #f (extract* (list (quote-syntax -abstract-neural-field)) exprs))]
+                          [(normal-plain-abstract-neural-fields)   
+                           (apply append (map normalize-init/neural-field plain-abstract-neural-fields))]
                           [(privates)
                            (flatten pair (extract* (list (quote-syntax -private)) decls))]
                           [(publics)
@@ -863,7 +884,7 @@
               ;;  Optionally transform them, can expand even if not transforming.
               (let* ([field-names (append (map norm-init/field-iid
                                                (append normal-plain-fields normal-plain-init-fields))
-                                          (map norm-init/neural-field-iid normal-plain-neural-fields))]
+                                          (map norm-init/neural-field-iid (append normal-plain-neural-fields normal-plain-abstract-neural-fields)))]
                      [inherit-field-names (map car inherit-fields)]
                      [plain-init-names (map norm-init/field-iid normal-plain-inits)]
                      [inherit-names (map car inherits)]
@@ -1013,7 +1034,8 @@
                       ;; inits
                       (check-dup "init" (map norm-init/field-eid (append normal-inits)))
                       ;; fields
-                      (check-dup "field" (map norm-init/field-eid (append normal-plain-fields normal-plain-init-fields))))
+                      (check-dup "field" (append (map norm-init/field-eid (append normal-plain-fields normal-plain-init-fields))
+                                                 (map norm-init/neural-field-eid (append normal-plain-neural-fields normal-plain-abstract-neural-fields)))))
                     
                     ;; -- Check that private/public/override/augride are defined --
                     ;; -- and that abstracts are *not* defined                   --
@@ -1182,6 +1204,37 @@
                                                                                                           (set-box! changed #f)
                                                                                                           (set! dispatch new-dispatch))]
                                                                                                        [else (dispatch msg val changed hold input-prev)])))))))
+                                                                                    (syntax->list #'(iid ...)))))]))
+                                                            (syntax->list #'(idp ...))))]
+                                          [(-fld orig idp ...) 
+                                           (and (identifier? #'-fld)
+                                                (free-identifier=? #'-fld #'-abstract-neural-field))
+                                           #`(begin #,@(map (lambda (neural-stx)
+                                                              (syntax-case neural-stx ()
+                                                                [((out ...) (in ...))
+                                                                 (with-syntax ([[((iid eid)) ...] (map normalize-init/field (syntax->list #'(out ...)))])
+                                                                   #`(begin #,@(map (lambda (this-iid)
+                                                                                      #`(set! #,this-iid
+                                                                                              (field-initialization-value
+                                                                                               (let ((val (box #f))
+                                                                                                     (changed (box #f))
+                                                                                                     (hold (box #f))
+                                                                                                     (input-prev (box #f))
+                                                                                                     (dispatch (lambda (msg val changed hold input-prev)
+                                                                                                                 (case msg
+                                                                                                                   [(get) (lambda () (error "cannot get an abstract neural field"))]
+                                                                                                                   [(set!) (lambda (new-value) (error "cannot set! an abstract neural field"))]
+                                                                                                                   [(set-no-trigger!) (lambda (new-value) (error "cannot set! an abstract neural field"))]
+                                                                                                                   [(get-input-fields) (lambda () (list in ...))]
+                                                                                                                   [else (error "you can only get or set a neural-field")]))))
+                                                                                                 (lambda (msg)
+                                                                                                   (case msg
+                                                                                                     [(update-dispatch!)
+                                                                                                      (lambda (new-dispatch)
+                                                                                                        (set-box! val #f)
+                                                                                                        (set-box! changed #f)
+                                                                                                        (set! dispatch new-dispatch))]
+                                                                                                     [else (dispatch msg val changed hold input-prev)]))))))
                                                                                     (syntax->list #'(iid ...)))))]))
                                                             (syntax->list #'(idp ...))))]
                                           [(-i-r id/rename)
@@ -1424,7 +1477,8 @@
                                                        (+ (length private-field-names)
                                                           (length plain-init-fields)
                                                           (length plain-fields)
-                                                          (length normal-plain-neural-fields)))]
+                                                          (length normal-plain-neural-fields)
+                                                          (length normal-plain-abstract-neural-fields)))]
                                           [field-names (map (lambda (norm)
                                                               (lookup-localize (norm-init/field-eid norm)))
                                                             (append
@@ -1433,7 +1487,7 @@
                                           [inherit-field-names (map lookup-localize (map cdr inherit-fields))]
                                           [neural-field-names (map (lambda (norm) 
                                                                      (lookup-localize (norm-init/neural-field-eid norm)))
-                                                                   normal-plain-neural-fields)]
+                                                                   (append normal-plain-neural-fields normal-plain-abstract-neural-fields))]
                                           [init-names (map (lambda (norm)
                                                              (lookup-localize
                                                               (norm-init/field-eid norm)))
