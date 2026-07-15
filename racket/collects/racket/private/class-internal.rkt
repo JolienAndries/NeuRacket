@@ -94,7 +94,7 @@
               pubment overment augride
               public-final override-final augment-final
               field init init-field init-rest
-              neural-field abstract-neural-field
+              neural-field abstract-neural-field augment-neural-field 
               rename-super rename-inner inherit inherit/super inherit/inner inherit-field
               this this% super inner
               super-make-object super-instantiate super-new
@@ -253,7 +253,8 @@
  [-init init]
  [-init-field init-field]
  [-neural-field neural-field]
- [-abstract-neural-field abstract-neural-field])
+ [-abstract-neural-field abstract-neural-field]
+ [-augment-neural-field augment-neural-field])
 
 
 (define-for-syntax not-in-a-class
@@ -374,6 +375,7 @@
                 (quote-syntax -inherit-field)
                 (quote-syntax -neural-field)
                 (quote-syntax -abstract-neural-field)
+                (quote-syntax -augment-neural-field)
                 (quote-syntax -private)
                 (quote-syntax -public)
                 (quote-syntax -override)
@@ -468,7 +470,7 @@
                                (if (ormap (lambda (i)
                                             (free-identifier=? (car l) i))
                                           (syntax-e (quote-syntax (-init -init-field -field
-                                                                         -neural-field -abstract-neural-field))))
+                                                                         -neural-field -abstract-neural-field -augment-neural-field))))
                                    (cddr l)
                                    (cdr l)))])
                       (if alone
@@ -557,7 +559,7 @@
             ;; ------ Basic syntax checks -----
             (for-each (lambda (stx)
                         (syntax-case stx (-init -init-rest -field -init-field -inherit-field
-                                                -neural-field -abstract-neural-field
+                                                -neural-field -abstract-neural-field -augment-neural-field
                                                 -private -public -override -augride
                                                 -public-final -override-final -augment-final
                                                 -pubment -overment -augment
@@ -644,10 +646,15 @@
                            ;; idp ... = [a 1] ... 
                            (for-each (lambda (idp)
                                        (syntax-case idp ()
-                                         [(id  [input ...]) (and (identifier? (syntax id))
-                                                                 (andmap (lambda (in) (identifier? (syntax in))) (syntax->list (syntax (input ...))))) 'ok]
-                                         [([id ...]  [input ...]) (and (andmap (lambda (in) (identifier? (syntax in))) (syntax->list (syntax (id ...))))
-                                                                       (andmap (lambda (in) (identifier? (syntax in))) (syntax->list (syntax (input ...))))) 'ok]
+                                         [(id  [input ...])
+                                          (and (identifier? (syntax id))
+                                               (andmap (lambda (in) (identifier? (syntax in)))
+                                                       (syntax->list (syntax (input ...))))) 'ok]
+                                         [([id ...]  [input ...])
+                                          (and (andmap (lambda (in) (identifier? (syntax in)))
+                                                       (syntax->list (syntax (id ...))))
+                                               (andmap (lambda (in) (identifier? (syntax in)))
+                                                       (syntax->list (syntax (input ...))))) 'ok]
                                          [else
                                           (bad 
                                            "abstract-neural-field element is not an optionally renamed identifier-expression pair"
@@ -655,6 +662,30 @@
                                      (syntax->list (syntax (idp ...))))]
                           [(-abstract-neural-field orig . rest) 
                            (bad "ill-formed abstract-neural-field clause" #'orig)]
+
+                          [(-augment-neural-field orig idp ...) 
+                           ;; idp ... = [a 1] ... 
+                           (for-each (lambda (idp)
+                                       (syntax-case idp ()
+                                         [(id MLo [input ...])
+                                          (and (identifier? (syntax id))
+                                               (identifier? (syntax MLo))
+                                               (andmap (lambda (in) (identifier? (syntax in)))
+                                                       (syntax->list (syntax (input ...))))) 'ok]
+                                         [([id ...] MLo [input ...])
+                                          (and (andmap (lambda (in) (identifier? (syntax in)))
+                                                       (syntax->list (syntax (id ...))))
+                                               (identifier? (syntax MLo))
+                                               (andmap (lambda (in) (identifier? (syntax in)))
+                                                       (syntax->list (syntax (input ...))))) 'ok]
+
+                                         [else
+                                          (bad 
+                                           "augment-neural-field element is not an optionally renamed identifier-expression pair"
+                                           idp)]))
+                                     (syntax->list (syntax (idp ...))))]
+                          [(-augment-neural-field orig . rest) 
+                           (bad "ill-formed augment-neural-field clause" #'orig)]
                           [(-private id ...)
                            (for-each
                             (lambda (id)
@@ -805,6 +836,11 @@
                            (flatten #f (extract* (list (quote-syntax -abstract-neural-field)) exprs))]
                           [(normal-plain-abstract-neural-fields)   
                            (apply append (map normalize-init/neural-field plain-abstract-neural-fields))]
+                          [(plain-augment-neural-fields)   
+                           (flatten #f (extract* (list (quote-syntax -augment-neural-field)) exprs))]
+                          [(normal-plain-augment-neural-fields) 
+                           (apply append (map normalize-init/neural-field plain-augment-neural-fields))]
+                   
                           [(privates)
                            (flatten pair (extract* (list (quote-syntax -private)) decls))]
                           [(publics)
@@ -1226,7 +1262,7 @@
                                                                                                                    [(set!) (lambda (new-value) (error "cannot set! an abstract neural field"))]
                                                                                                                    [(set-no-trigger!) (lambda (new-value) (error "cannot set! an abstract neural field"))]
                                                                                                                    [(get-input-fields) (lambda () (list in ...))]
-                                                                                                                   [else (error "you can only get or set a neural-field")]))))
+                                                                                                                   [else (error "abstract neural field: unknown message")]))))
                                                                                                  (lambda (msg)
                                                                                                    (case msg
                                                                                                      [(update-dispatch!)
@@ -1237,6 +1273,51 @@
                                                                                                      [else (dispatch msg val changed hold input-prev)]))))))
                                                                                     (syntax->list #'(iid ...)))))]))
                                                             (syntax->list #'(idp ...))))]
+                                          [(-fld orig idp ...) 
+                                           (and (identifier? #'-fld)
+                                                (free-identifier=? #'-fld #'-augment-neural-field))
+                                           #`(begin element #,@(map (lambda (neural-stx)
+                                                                      (syntax-case neural-stx ()
+                                                                        [((out ...) MLo (in ...))
+                                                                         (with-syntax ([[((iid eid)) ...] (map normalize-init/field (syntax->list #'(out ...)))])
+                                                                           #`(begin #,@(map (lambda (this-iid)
+                                                                                              (let ((replaced-out-iids (map (lambda (id)  (if (free-identifier=? id this-iid)
+                                                                                                                                              #'(unbox val)
+                                                                                                                                              (datum->syntax id `(get-field ,(syntax-e id) this))))
+                                                                                                                            (syntax->list #'(iid ...)))))
+                                                                                                #`(let* ((get-input-fields-parent ((access-neural-field!  #,this-iid this) 'get-input-fields))
+                                                                                                         (get-input-fields (lambda ()
+                                                                                                                             (append (get-input-fields-parent)
+                                                                                                                                     (list in ...)))))
+                                                                                          
+                                                                                                    (((access-neural-field!  #,this-iid this) 'update-dispatch!) (lambda (msg val changed hold input-prev)
+                                                                                                                                                                   (define (set-val! new-value)
+                                                                                                                                                                     (set-box! changed #t)
+                                                                                                                                                                     (set-box! val new-value))
+                                                                                                                                                                   (case msg
+                                                                                                                                                                     [(get)  (lambda ()
+                                                                                                                                                                               (cond ((and (train-mode) (unbox changed)) (unbox val))
+                                                                                                                                                                                     ((train-mode) (error "cannot get an unassigned augment neural field in train mode"))
+                                                                                                                                                                                     ((equal? (unbox input-prev) (list in ...)) (unbox hold))
+                                                                                                                                                                                     (else (let-values ([(iid ...) (send/apply MLo infer (get-input-fields))])
+                                                                                                                                                                                             (set-box! input-prev (list in ...))
+                                                                                                                                                                                             (set-box! hold #,this-iid)
+                                                                                                                                                                                             #,this-iid))))]
+                                                                                                                                                                     [(set!) (lambda (new-value)
+                                                                                                                                                                               (if (train-mode)
+                                                                                                                                                                                   (begin 
+                                                                                                                                                                                     (set-val! new-value)
+                                                                                                                                                                                     (send/apply MLo train #,@replaced-out-iids (get-input-fields)))
+                                                                                                                                                                                   (error "cannot assign to an augment neural field during infer-mode")))]
+                                                                                                                                                                     [(set-no-trigger!) (lambda (new-value)
+                                                                                                                                                                                          (if (train-mode)
+                                                                                                                                                                                              (set-val! new-value)
+                                                                                                                                                                                              (error "cannot assign to an augment neural field during infer-mode")))]
+                                                                                                            
+                                                                                                                                                                     [(get-input-fields) get-input-fields]
+                                                                                                                                                                     [else (error "augment-neural-field: unknown message")]))))))
+                                                                                            (syntax->list #'(iid ...)))))]))
+                                                                    (syntax->list #'(idp ...))))]
                                           [(-i-r id/rename)
                                            (and (identifier? #'-i-r) 
                                                 (free-identifier=? #'-i-r #'-init-rest))
