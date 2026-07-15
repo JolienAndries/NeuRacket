@@ -94,6 +94,7 @@
               pubment overment augride
               public-final override-final augment-final
               field init init-field init-rest
+              neural-field
               rename-super rename-inner inherit inherit/super inherit/inner inherit-field
               this this% super inner
               super-make-object super-instantiate super-new
@@ -250,7 +251,8 @@
 (provide-class-define-like-keyword 
  [-field field]
  [-init init]
- [-init-field init-field])
+ [-init-field init-field]
+ [-neural-field neural-field])
 
 
 (define-for-syntax not-in-a-class
@@ -315,6 +317,17 @@
         [field-set! (make-struct-field-mutator (class-field-set! cls) rpos)])
     (vector field-ref field-set! field-ref field-set!)))
 
+(define (make-neural-field-info cls rpos)
+  (let ([field-ref (make-struct-field-accessor (class-field-ref cls) rpos)]
+        [field-set! (make-struct-field-mutator (class-field-set! cls) rpos)])
+    
+    (let ([neural-field-ref (λ (o) (((field-ref o) 'get))) ]
+          [neural-field-set! (λ (o v)  (((field-ref o) 'set!) v))]
+          [neural-field-no-trigger-set! (λ (o v) (((field-ref o) 'set-no-trigger!) v))]
+          [neural-field-accessor field-ref])
+    
+      (vector neural-field-ref neural-field-set! neural-field-ref neural-field-set! neural-field-no-trigger-set! neural-field-accessor))))
+
 (define (field-info-extend-internal fi ppos pneg neg-party)
   (let* ([old-ref (unsafe-vector-ref fi 0)]
          [old-set! (unsafe-vector-ref fi 1)])
@@ -335,6 +348,8 @@
 (define (field-info-internal-set! fi) (unsafe-vector-ref fi 1))
 (define (field-info-external-ref  fi) (unsafe-vector-ref fi 2))
 (define (field-info-external-set! fi) (unsafe-vector-ref fi 3))
+(define (field-info-external-no-trigger-set! fi) (unsafe-vector-ref fi 4))
+(define (field-info-neural-field fi) (unsafe-vector-ref fi 5))
 
 ;;--------------------------------------------------------------------
 ;;  class macros
@@ -356,6 +371,7 @@
                 (quote-syntax -field)
                 (quote-syntax -init-field)
                 (quote-syntax -inherit-field)
+                (quote-syntax -neural-field) 
                 (quote-syntax -private)
                 (quote-syntax -public)
                 (quote-syntax -override)
@@ -449,7 +465,8 @@
                     (let ([l (let ([l (syntax->list i)])
                                (if (ormap (lambda (i)
                                             (free-identifier=? (car l) i))
-                                          (syntax-e (quote-syntax (-init -init-field -field))))
+                                          (syntax-e (quote-syntax (-init -init-field -field
+                                                                         -neural-field))))
                                    (cddr l)
                                    (cdr l)))])
                       (if alone
@@ -476,6 +493,15 @@
     
     (define ((norm-init/field-iid/def-ctx def-ctx) norm) (syntax-local-identifier-as-binding (stx-car (stx-car norm)) def-ctx))
     (define ((norm-init/field-eid/def-ctx def-ctx) norm) (syntax-local-identifier-as-binding (stx-car (stx-cdr (stx-car norm))) def-ctx))
+
+    (define (normalize-init/neural-field i)
+      ;; neural-field : (neural-field ((nrl ...) obj (in ...)) ...) => i : ((nrl ...) obj (in ...))
+      (let ((field-names (syntax->list (stx-car i))))
+        (map (normalize-init/field i)
+             field-names)))
+    (define ((norm-init/neural-field-iid/def-ctx def-ctx) norm)  (syntax-local-identifier-as-binding (stx-car norm) def-ctx))  
+    (define ((norm-init/neural-field-eid/def-ctx def-ctx) norm)  (syntax-local-identifier-as-binding (stx-car (stx-cdr norm)) def-ctx))
+
     
     ;; --------------------------------------------------------------------------------
     ;; Start here:
@@ -488,6 +514,8 @@
         (let* ([def-ctx (syntax-local-make-definition-context)]
                [norm-init/field-iid (norm-init/field-iid/def-ctx def-ctx)]
                [norm-init/field-eid (norm-init/field-eid/def-ctx def-ctx)]
+               [norm-init/neural-field-iid (norm-init/neural-field-iid/def-ctx def-ctx)] 
+               [norm-init/neural-field-eid (norm-init/neural-field-eid/def-ctx def-ctx)] 
                [flatten (flatten/def-ctx def-ctx)]
                [localized-map (make-bound-identifier-mapping)]
                [any-localized? #f]
@@ -527,6 +555,7 @@
             ;; ------ Basic syntax checks -----
             (for-each (lambda (stx)
                         (syntax-case stx (-init -init-rest -field -init-field -inherit-field
+                                                -neural-field
                                                 -private -public -override -augride
                                                 -public-final -override-final -augment-final
                                                 -pubment -overment -augment
@@ -584,6 +613,31 @@
                                      (syntax->list (syntax (idp ...))))]
                           [(-field orig . rest)
                            (bad "ill-formed field clause" #'orig)]
+                          [(-neural-field orig idp ...) 
+                           ;; idp ... = [a 1] ... 
+                           (for-each (lambda (idp)
+                                       (syntax-case idp ()
+                                         [(id MLo [input ...])
+                                          (and (identifier? (syntax id))
+                                               (identifier? (syntax MLo))
+                                               (andmap (lambda (in) (identifier? (syntax in)))
+                                                       (syntax->list (syntax (input ...)))))
+                                          'ok]
+                                         [([id ...] MLo [input ...])
+                                          (and (andmap (lambda (in) (identifier? (syntax in)))
+                                                       (syntax->list (syntax (id ...))))
+                                               (identifier? (syntax MLo))
+                                               (andmap (lambda (in) (identifier? (syntax in)))
+                                                       (syntax->list (syntax (input ...)))))
+                                          'ok]
+
+                                         [else
+                                          (bad 
+                                           "neural-field element is not an optionally renamed identifier-expression pair"
+                                           idp)]))
+                                     (syntax->list (syntax (idp ...))))]
+                          [(-neural-field orig . rest) 
+                           (bad "ill-formed augment-neural-field clause" #'orig)]
                           [(-private id ...)
                            (for-each
                             (lambda (id)
@@ -726,6 +780,10 @@
                            (map normalize-init/field plain-init-fields)]
                           [(inherit-fields)
                            (flatten pair (extract* (list (quote-syntax -inherit-field)) decls))]
+                          [(plain-neural-fields)     
+                           (flatten #f (extract* (list (quote-syntax -neural-field)) exprs))]
+                          [(normal-plain-neural-fields)   
+                           (apply append (map normalize-init/neural-field plain-neural-fields))]
                           [(privates)
                            (flatten pair (extract* (list (quote-syntax -private)) decls))]
                           [(publics)
@@ -803,8 +861,9 @@
               
               ;; ----- Extract method definitions; check that they look like procs -----
               ;;  Optionally transform them, can expand even if not transforming.
-              (let* ([field-names (map norm-init/field-iid
-                                       (append normal-plain-fields normal-plain-init-fields))]
+              (let* ([field-names (append (map norm-init/field-iid
+                                               (append normal-plain-fields normal-plain-init-fields))
+                                          (map norm-init/neural-field-iid normal-plain-neural-fields))]
                      [inherit-field-names (map car inherit-fields)]
                      [plain-init-names (map norm-init/field-iid normal-plain-inits)]
                      [inherit-names (map car inherits)]
@@ -913,17 +972,17 @@
                     ;; -- Look for duplicates --
                     (let-values ([(dup origs)
                                   (stx-find-duplicate-identifiers
-                                    (append defined-syntax-names
-                                            defined-method-names
-                                            private-field-names
-                                            field-names
-                                            inherit-field-names
-                                            plain-init-names
-                                            inherit-names
-                                            inherit/super-names
-                                            inherit/inner-names
-                                            rename-super-names
-                                            rename-inner-names))])
+                                   (append defined-syntax-names
+                                           defined-method-names
+                                           private-field-names
+                                           field-names
+                                           inherit-field-names
+                                           plain-init-names
+                                           inherit-names
+                                           inherit/super-names
+                                           inherit/inner-names
+                                           rename-super-names
+                                           rename-inner-names))])
                       (when dup
                         (bad "duplicate declared identifier" dup origs)))
                     
@@ -975,20 +1034,20 @@
                          (let ([l (hash-ref ht (syntax-e pubovr-name) null)]
                                [stx-l (hash-ref stx-ht (syntax-e pubovr-name) null)])
                            (cond ;; defined as value
-                                 [(ormap (lambda (i) (bound-identifier=? i pubovr-name)) l)
-                                  ;; check if abstract and fail if so
-                                  (when (memq pubovr-name abstract-names)
-                                    (bad "method declared as abstract but was defined"
-                                         pubovr-name))]
-                                 ;; defined as syntax
-                                 [(ormap (lambda (i) (bound-identifier=? i pubovr-name)) stx-l)
-                                  (bad "method declared but defined as syntax"
-                                       pubovr-name)]
-                                 ;; undefined
-                                 [else
-                                  (unless (memq pubovr-name abstract-names)
-                                    (bad "method declared as concrete but not defined"
-                                         pubovr-name))])))
+                             [(ormap (lambda (i) (bound-identifier=? i pubovr-name)) l)
+                              ;; check if abstract and fail if so
+                              (when (memq pubovr-name abstract-names)
+                                (bad "method declared as abstract but was defined"
+                                     pubovr-name))]
+                             ;; defined as syntax
+                             [(ormap (lambda (i) (bound-identifier=? i pubovr-name)) stx-l)
+                              (bad "method declared but defined as syntax"
+                                   pubovr-name)]
+                             ;; undefined
+                             [else
+                              (unless (memq pubovr-name abstract-names)
+                                (bad "method declared as concrete but not defined"
+                                     pubovr-name))])))
                        local-method-names))
                     
                     ;; ---- Check that rename-inner doesn't have a non-final decl ---
@@ -1059,7 +1118,7 @@
                                                 #'_init)))]
                                           [(-fld orig idp ...)
                                            (and (identifier? #'-fld)
-					        (free-identifier=? #'-fld #'-field))
+                                                (free-identifier=? #'-fld #'-field))
                                            (with-syntax ([(((iid eid) expr) ...)
                                                           (map normalize-init/field (syntax->list #'(idp ...)))])
                                              (syntax-track-origin
@@ -1068,6 +1127,63 @@
                                                               ...))
                                               e
                                               #'-fld))]
+                                          [(-fld orig idp ...) 
+                                           (and (identifier? #'-fld)
+                                                (free-identifier=? #'-fld #'-neural-field))
+                                           #`(begin  #,@(map(lambda (neural-stx)
+                                                              (syntax-case neural-stx ()
+                                                                [((out ...) MLo (in ...))
+                                                                 (with-syntax ([[((iid eid)) ...] (map normalize-init/field (syntax->list #'(out ...)))])
+                                                                   #`(begin #,@(map (lambda (this-iid)
+                                                                                      (let ((replaced-iids) (map (lambda (id) (if (free-identifier=? id this-iid)
+                                                                                                                                  #'(unbox val)
+                                                                                                                                  #`((#,id 'get))))
+                                                                                                                 (syntax->list #'(iid ...))))
+                                                                                        #`(set! #,this-iid
+                                                                                                (field-initialization-value
+                                                                                                 (let ((val (box #f))
+                                                                                                       (changed (box #f))
+                                                                                                       (hold (box #f))
+                                                                                                       (input-prev (box #f))
+                                                                                                       (dispatch
+                                                                                                        (lambda (msg val changed hold input-prev)
+                                                                                                          (define (set-val! new-value)
+                                                                                                            (set-box! changed #t)
+                                                                                                            (set-box! val new-value))
+                                                                                                          (case msg
+                                                                                                            [(get)
+                                                                                                             (lambda ()
+                                                                                                               (cond ((and (train-mode) (unbox changed))  (unbox val))
+                                                                                                                     ((train-mode) (error  "cannot get an unassigned neural field in train mode" #,this-iid))
+                                                                                                                     ((equal? (unbox input-prev) (list in ...)) (unbox hold))
+                                                                                                                     (else (let-values ([(iid ...) (send MLo infer in ...)])
+                                                                                                                             (set-box! input-prev (list in ...))
+                                                                                                                             (set-box! hold #,this-iid)
+                                                                                                                             #,this-iid))))]
+                                                                                                            [(set!)
+                                                                                                             (lambda (new-value)
+                                                                                                               (if (train-mode)
+                                                                                                                   (begin 
+                                                                                                                     (set-val! new-value)
+                                                                                                                     (send MLo train #,@replaced-iids in ...))
+                                                                                                                   (error "cannot assign to a neural field during infer-mode")))]
+                                                                                                            [(set-no-trigger!)
+                                                                                                             (lambda (new-value)
+                                                                                                               (if (train-mode)
+                                                                                                                   (set-val! new-value)
+                                                                                                                   (error "cannot assign to a neural field during infer-mode")))]
+                                                                                                            [(get-input-fields) (lambda () (list in ...))]
+                                                                                                            [else (error "can only get or set a neural-field")]))))
+                                                                                                   (lambda (msg)
+                                                                                                     (case msg
+                                                                                                       [(update-dispatch!)
+                                                                                                        (lambda (new-dispatch)
+                                                                                                          (set-box! val #f)
+                                                                                                          (set-box! changed #f)
+                                                                                                          (set! dispatch new-dispatch))]
+                                                                                                       [else (dispatch msg val changed hold input-prev)])))))))
+                                                                                    (syntax->list #'(iid ...)))))]))
+                                                            (syntax->list #'(idp ...))))]
                                           [(-i-r id/rename)
                                            (and (identifier? #'-i-r) 
                                                 (free-identifier=? #'-i-r #'-init-rest))
@@ -1279,11 +1395,11 @@
                                                            [extra-init-mappings extra-init-mappings])
                                                (syntax
                                                 (syntax-parameterize 
-                                                 ([super-instantiate-param super-error-map]
-                                                  [super-make-object-param super-error-map]
-                                                  [super-new-param super-error-map])
-                                                 (letrec-syntaxes+values extra-init-mappings ()
-                                                   proc))))))
+                                                    ([super-instantiate-param super-error-map]
+                                                     [super-make-object-param super-error-map]
+                                                     [super-new-param super-error-map])
+                                                  (letrec-syntaxes+values extra-init-mappings ()
+                                                    proc))))))
                                       methods)))]
                                 [lookup-localize-cdr (lambda (p) (lookup-localize (cdr p)))])
                             
@@ -1307,13 +1423,17 @@
                                                        (quote-syntax here)
                                                        (+ (length private-field-names)
                                                           (length plain-init-fields)
-                                                          (length plain-fields)))]
+                                                          (length plain-fields)
+                                                          (length normal-plain-neural-fields)))]
                                           [field-names (map (lambda (norm)
                                                               (lookup-localize (norm-init/field-eid norm)))
                                                             (append
                                                              normal-plain-fields
                                                              normal-plain-init-fields))]
                                           [inherit-field-names (map lookup-localize (map cdr inherit-fields))]
+                                          [neural-field-names (map (lambda (norm) 
+                                                                     (lookup-localize (norm-init/neural-field-eid norm)))
+                                                                   normal-plain-neural-fields)]
                                           [init-names (map (lambda (norm)
                                                              (lookup-localize
                                                               (norm-init/field-eid norm)))
@@ -1349,12 +1469,12 @@
                                           [deserialize-id-expr deserialize-id-expr]
                                           [private-field-names private-field-names])
                               (class-syntax-protect
-                              (add-decl-props
-                              def-ctx
-                              (append inspect-decls decls)
-                              (quasisyntax/loc stx
-                                (detect-field-unsafe-undefined
-                                 compose-class
+                               (add-decl-props
+                                def-ctx
+                                (append inspect-decls decls)
+                                (quasisyntax/loc stx
+                                  (detect-field-unsafe-undefined
+                                   compose-class
                                    'name 
                                    super-expression
                                    (list interface-expression ...)
@@ -1365,6 +1485,7 @@
                                    `field-names
                                    `inherit-field-names
                                    `private-field-names ; for undefined-checking property
+                                   `neural-field-names
                                    ;; Method names:
                                    `(rename-super-name ... rename-super-extra-name ...)
                                    `(rename-inner-name ... rename-inner-extra-name ...)
@@ -1400,137 +1521,137 @@
                                               (make-struct-field-mutator local-mutator local-field-pos #f)]
                                              ...)
                                          (syntax-parameterize
-                                          ([this-param (make-this-map (quote-syntax this-id)
-                                                                      (quote-syntax the-finder)
-                                                                      (quote the-obj))]
-                                           [this%-param (make-this%-map (quote-syntax (object-ref this))
-                                                                        (quote-syntax the-finder))])
-                                          (let-syntaxes
-                                           mappings
-                                           (syntax-parameterize 
-                                            ([super-param
-                                              (lambda (stx)
-                                                (syntax-case stx (rename-super-extra-orig ...)
-                                                  [(_ rename-super-extra-orig . args) 
-                                                   (generate-super-call 
-                                                    stx
-                                                    (quote-syntax the-finder)
-                                                    (quote the-obj)
-                                                    (quote-syntax rename-super-extra-temp)
-                                                    (syntax args))]
-                                                  ...
-                                                  [(_ id . args)
-                                                   (identifier? #'id)
-                                                   (raise-syntax-error
-                                                    #f
-                                                    (string-append
-                                                     "identifier for super call does not have an override, "
-                                                     "override-final, overment, or inherit/super declaration")
-                                                    stx
-                                                    #'id)]
-                                                  [_else
-                                                   (raise-syntax-error
-                                                    #f
-                                                    "expected an identifier after the keyword"
-                                                    stx)]))]
-                                             [inner-param
-                                              (lambda (stx)
-                                                (syntax-case stx (rename-inner-extra-orig ...)
-                                                  [(_ default-expr rename-inner-extra-orig . args)
-                                                   (generate-inner-call 
-                                                    stx
-                                                    (quote-syntax the-finder)
-                                                    (quote the-obj)
-                                                    (syntax default-expr)
-                                                    (quote-syntax rename-inner-extra-temp)
-                                                    (syntax args))]
-                                                  ...
-                                                  [(_ default-expr id . args)
-                                                   (identifier? #'id)
-                                                   (raise-syntax-error
-                                                    #f
-                                                    (string-append
-                                                     "identifier for inner call does not have a pubment, augment, "
-                                                     "overment, or inherit/inner declaration")
-                                                    stx
-                                                    #'id)]
-                                                  [(_)
-                                                   (raise-syntax-error
-                                                    #f
-                                                    "expected a default-value expression after the keyword"
-                                                    stx
-                                                    #'id)]
-                                                  [_else
-                                                   (raise-syntax-error
-                                                    #f
-                                                    "expected an identifier after the keyword and default-value expression"
-                                                    stx)]))])
-                                            stx-def ...
-                                            (letrec ([private-temp private-method]
-                                                     ...
-                                                     [pubment-temp pubment-method]
-                                                     ...
-                                                     [public-final-temp public-final-method]
-                                                     ...)
-                                              (values
-                                               (list pubment-temp ... public-final-temp ...
-                                                     abstract-method ... . public-methods)
-                                               (list . override-methods)
-                                               (list . augride-methods)
-                                               ;; Initialization
-                                               #, ;; Attach srcloc (useful for profiling)
-                                               (quasisyntax/loc stx
-                                                 (lambda (the-obj super-go si_c si_inited? si_leftovers init-args)
-                                                   (syntax-parameterize ([the-finder (quote-syntax the-obj)])
-                                                     (syntax-parameterize
-                                                      ([super-instantiate-param
-                                                        (lambda (stx)
-                                                          (syntax-case stx () 
-                                                            [(_ (arg (... ...)) (kw kwarg) (... ...))
-                                                             (with-syntax ([stx stx])
-                                                               (syntax
-                                                                (begin
-                                                                  `(declare-super-new)
-                                                                  (-instantiate super-go stx #f (the-obj si_c si_inited? 
-                                                                                                         si_leftovers)
-                                                                                (list arg (... ...)) 
-                                                                                (kw kwarg) (... ...)))))]))]
-                                                       [super-new-param
-                                                        (lambda (stx)
-                                                          (syntax-case stx () 
-                                                            [(_ (kw kwarg) (... ...))
-                                                             (with-syntax ([stx stx])
-                                                               (syntax
-                                                                (begin
-                                                                  `(declare-super-new)
-                                                                  (-instantiate super-go stx #f (the-obj si_c si_inited? 
-                                                                                                         si_leftovers)
-                                                                                null
-                                                                                (kw kwarg) (... ...)))))]))]
-                                                       [super-make-object-param
-                                                        (lambda (stx)
-                                                          (let ([code 
-                                                                 (quote-syntax
-                                                                  (lambda args
-                                                                    (super-go the-obj si_c si_inited? si_leftovers args null)))])
-                                                            #`(begin
-                                                                `(declare-super-new)
-                                                                #,(if (identifier? stx)
-                                                                      code
-                                                                      (datum->syntax
-                                                                       code
-                                                                       (cons code
-                                                                             (cdr (syntax-e stx))))))))])
-                                                      (letrec-syntaxes+values
-                                                          ([(plain-init-name) (make-init-redirect 
-                                                                               (quote-syntax local-plain-init-name)
-                                                                               (quote-syntax plain-init-name-without-def-ctx)
-                                                                               (quote-syntax plain-init-name-localized))] ...)
-                                                        ([(local-plain-init-name) unsafe-undefined] ...)
-                                                        (void) ; in case the body is empty
-                                                        (begin
-                                                          '(declare-field-use-start) ; see "class-undef.rkt"
-                                                          . exprs))))))))))))))
+                                             ([this-param (make-this-map (quote-syntax this-id)
+                                                                         (quote-syntax the-finder)
+                                                                         (quote the-obj))]
+                                              [this%-param (make-this%-map (quote-syntax (object-ref this))
+                                                                           (quote-syntax the-finder))])
+                                           (let-syntaxes
+                                            mappings
+                                            (syntax-parameterize 
+                                                ([super-param
+                                                  (lambda (stx)
+                                                    (syntax-case stx (rename-super-extra-orig ...)
+                                                      [(_ rename-super-extra-orig . args) 
+                                                       (generate-super-call 
+                                                        stx
+                                                        (quote-syntax the-finder)
+                                                        (quote the-obj)
+                                                        (quote-syntax rename-super-extra-temp)
+                                                        (syntax args))]
+                                                      ...
+                                                      [(_ id . args)
+                                                       (identifier? #'id)
+                                                       (raise-syntax-error
+                                                        #f
+                                                        (string-append
+                                                         "identifier for super call does not have an override, "
+                                                         "override-final, overment, or inherit/super declaration")
+                                                        stx
+                                                        #'id)]
+                                                      [_else
+                                                       (raise-syntax-error
+                                                        #f
+                                                        "expected an identifier after the keyword"
+                                                        stx)]))]
+                                                 [inner-param
+                                                  (lambda (stx)
+                                                    (syntax-case stx (rename-inner-extra-orig ...)
+                                                      [(_ default-expr rename-inner-extra-orig . args)
+                                                       (generate-inner-call 
+                                                        stx
+                                                        (quote-syntax the-finder)
+                                                        (quote the-obj)
+                                                        (syntax default-expr)
+                                                        (quote-syntax rename-inner-extra-temp)
+                                                        (syntax args))]
+                                                      ...
+                                                      [(_ default-expr id . args)
+                                                       (identifier? #'id)
+                                                       (raise-syntax-error
+                                                        #f
+                                                        (string-append
+                                                         "identifier for inner call does not have a pubment, augment, "
+                                                         "overment, or inherit/inner declaration")
+                                                        stx
+                                                        #'id)]
+                                                      [(_)
+                                                       (raise-syntax-error
+                                                        #f
+                                                        "expected a default-value expression after the keyword"
+                                                        stx
+                                                        #'id)]
+                                                      [_else
+                                                       (raise-syntax-error
+                                                        #f
+                                                        "expected an identifier after the keyword and default-value expression"
+                                                        stx)]))])
+                                              stx-def ...
+                                              (letrec ([private-temp private-method]
+                                                       ...
+                                                       [pubment-temp pubment-method]
+                                                       ...
+                                                       [public-final-temp public-final-method]
+                                                       ...)
+                                                (values
+                                                 (list pubment-temp ... public-final-temp ...
+                                                       abstract-method ... . public-methods)
+                                                 (list . override-methods)
+                                                 (list . augride-methods)
+                                                 ;; Initialization
+                                                 #, ;; Attach srcloc (useful for profiling)
+                                                 (quasisyntax/loc stx
+                                                   (lambda (the-obj super-go si_c si_inited? si_leftovers init-args)
+                                                     (syntax-parameterize ([the-finder (quote-syntax the-obj)])
+                                                       (syntax-parameterize
+                                                           ([super-instantiate-param
+                                                             (lambda (stx)
+                                                               (syntax-case stx () 
+                                                                 [(_ (arg (... ...)) (kw kwarg) (... ...))
+                                                                  (with-syntax ([stx stx])
+                                                                    (syntax
+                                                                     (begin
+                                                                       `(declare-super-new)
+                                                                       (-instantiate super-go stx #f (the-obj si_c si_inited? 
+                                                                                                              si_leftovers)
+                                                                                     (list arg (... ...)) 
+                                                                                     (kw kwarg) (... ...)))))]))]
+                                                            [super-new-param
+                                                             (lambda (stx)
+                                                               (syntax-case stx () 
+                                                                 [(_ (kw kwarg) (... ...))
+                                                                  (with-syntax ([stx stx])
+                                                                    (syntax
+                                                                     (begin
+                                                                       `(declare-super-new)
+                                                                       (-instantiate super-go stx #f (the-obj si_c si_inited? 
+                                                                                                              si_leftovers)
+                                                                                     null
+                                                                                     (kw kwarg) (... ...)))))]))]
+                                                            [super-make-object-param
+                                                             (lambda (stx)
+                                                               (let ([code 
+                                                                      (quote-syntax
+                                                                       (lambda args
+                                                                         (super-go the-obj si_c si_inited? si_leftovers args null)))])
+                                                                 #`(begin
+                                                                     `(declare-super-new)
+                                                                     #,(if (identifier? stx)
+                                                                           code
+                                                                           (datum->syntax
+                                                                            code
+                                                                            (cons code
+                                                                                  (cdr (syntax-e stx))))))))])
+                                                         (letrec-syntaxes+values
+                                                             ([(plain-init-name) (make-init-redirect 
+                                                                                  (quote-syntax local-plain-init-name)
+                                                                                  (quote-syntax plain-init-name-without-def-ctx)
+                                                                                  (quote-syntax plain-init-name-localized))] ...)
+                                                           ([(local-plain-init-name) unsafe-undefined] ...)
+                                                           (void) ; in case the body is empty
+                                                           (begin
+                                                             '(declare-field-use-start) ; see "class-undef.rkt"
+                                                             . exprs))))))))))))))
                                    ;; Extra argument added here by `detect-field-unsafe-undefined`
                                    #; check-undef?
                                    ;; Not primitive:
@@ -1540,46 +1661,46 @@
     (values
      ;; class*
      (lambda (stx)
-        (syntax-case stx ()
-          [(_  super-expression (interface-expr ...)
-               defn-or-expr
-               ...)
-           (main stx
-                 #'super-expression 
-                 #f #f
-                 (syntax->list #'(interface-expr ...))
-                 (syntax->list #'(defn-or-expr ...)))]
-          [(_  super-expression no-parens-interface-expr
-               defn-or-expr
-               ...)
-           (raise-syntax-error 'class*
-                               "expected a sequence of interfaces"
-                               stx
-                               #'no-parens-interface-expr)]))
-     ;; class
-     (lambda (stx)
-        (syntax-case stx ()
-          [(_ super-expression
+       (syntax-case stx ()
+         [(_  super-expression (interface-expr ...)
               defn-or-expr
               ...)
-           (main stx
-                 #'super-expression 
-                 #f #f
-                 null
-                 (syntax->list #'(defn-or-expr ...)))]))
+          (main stx
+                #'super-expression 
+                #f #f
+                (syntax->list #'(interface-expr ...))
+                (syntax->list #'(defn-or-expr ...)))]
+         [(_  super-expression no-parens-interface-expr
+              defn-or-expr
+              ...)
+          (raise-syntax-error 'class*
+                              "expected a sequence of interfaces"
+                              stx
+                              #'no-parens-interface-expr)]))
+     ;; class
+     (lambda (stx)
+       (syntax-case stx ()
+         [(_ super-expression
+             defn-or-expr
+             ...)
+          (main stx
+                #'super-expression 
+                #f #f
+                null
+                (syntax->list #'(defn-or-expr ...)))]))
      ;; class/derived
      (lambda (stx)
-        (syntax-case stx ()
-          [(_  orig-stx
-               [name-id super-expression (interface-expr ...) deserialize-id-expr]
-               defn-or-expr
-               ...)
-           (main #'orig-stx
-                 #'super-expression 
-                 #'deserialize-id-expr 
-                 (and (syntax-e #'name-id) #'name-id)
-                 (syntax->list #'(interface-expr ...))
-                 (syntax->list #'(defn-or-expr ...)))]))
+       (syntax-case stx ()
+         [(_  orig-stx
+              [name-id super-expression (interface-expr ...) deserialize-id-expr]
+              defn-or-expr
+              ...)
+          (main #'orig-stx
+                #'super-expression 
+                #'deserialize-id-expr 
+                (and (syntax-e #'name-id) #'name-id)
+                (syntax->list #'(interface-expr ...))
+                (syntax->list #'(defn-or-expr ...)))]))
      )))
 
 (begin-for-syntax
@@ -1790,18 +1911,18 @@
              (loop (expand stx locals) #f name locals)
              (bad "bad form for method definition" orig-stx))])))
     
-    (define (add-method-property l)
-      (syntax-property l 'method-arity-error #t))
+  (define (add-method-property l)
+    (syntax-property l 'method-arity-error #t))
 
-    ;; `class' wants to be priviledged with respect to
-    ;; syntax taints: save the declaration-time inspector and use it 
-    ;; to disarm syntax taints
-    (define method-insp (variable-reference->module-declaration-inspector
-                         (#%variable-reference)))
-    (define (disarm stx)
-      (syntax-disarm stx method-insp))
-    (define (rearm new old)
-      (syntax-rearm new old)))
+  ;; `class' wants to be priviledged with respect to
+  ;; syntax taints: save the declaration-time inspector and use it 
+  ;; to disarm syntax taints
+  (define method-insp (variable-reference->module-declaration-inspector
+                       (#%variable-reference)))
+  (define (disarm stx)
+    (syntax-disarm stx method-insp))
+  (define (rearm new old)
+    (syntax-rearm new old)))
 
 (define-syntax (-define-serializable-class stx)
   (syntax-case stx ()
@@ -1829,7 +1950,7 @@
                                          super-expression 
                                          (interface-expr ...)
                                          #'deserialize-name-info]
-                  defn-or-expr ...))
+                               defn-or-expr ...))
               provision ...))))]))
 
 (define-syntax (define-serializable-class* stx)
@@ -2056,6 +2177,7 @@
                        public-field-names  ; list of symbols (shorter than num-fields)
                        inherit-field-names ; list of symbols (not included in num-fields)
                        private-field-names ; list of symbols (the rest of num-fields)
+                       neural-field-names
                        
                        rename-super-names  ; list of symbols
                        rename-inner-names
@@ -2136,7 +2258,7 @@
                                                              def))))]
                     [else
                      (values names (cons var override-names) methods (cons impl overrides) public-ht override-ht
-                                  (hash-set defaults var def))]))]
+                             (hash-set defaults var def))]))]
             [(hash-ref public-ht var #f)
              (obj-error 'class* "method has implementation in superinterface"
                         "method name" (as-write var)
@@ -2208,7 +2330,7 @@
                                   (null? augride-names)
                                   (null? final-names)
                                   (null? default-override-names))]
-         [no-new-fields? (null? public-field-names)]
+         [no-new-fields? (and (null? public-field-names) (null? neural-field-names))]
          [xappend (lambda (a b) (if (null? b) a (append a b)))])
     
     ;; -- Check interfaces ---
@@ -2253,12 +2375,12 @@
       
       ;; Keep check here for early failure, will add to hashtable later in this function.
       (unless no-new-fields?
-        (for ([id (in-list public-field-names)])
+        (for ([id (in-list (append public-field-names neural-field-names))])
           (when (hash-ref field-ht id #f)
-              (obj-error 'class* "superclass already contains field"
-                         "superclass" super
-                         "field name" (as-write id)
-                         #:class-name name))))
+            (obj-error 'class* "superclass already contains field"
+                       "superclass" super
+                       "field name" (as-write id)
+                       #:class-name name))))
       
       ;; Check that superclass has expected fields
       (for-each (lambda (id)
@@ -2471,9 +2593,14 @@
                                 (values (field-info-internal-ref fi) (field-info-internal-set! fi))))])
                 ;; Add class/index pairs for public fields.
                 (unless no-new-fields?
-                  (for ([id (in-list public-field-names)]
-                        [i (in-naturals)])
-                    (hash-set! field-ht id (make-field-info c i))))
+                  (let ((tmp-i 0)) 
+                    (for ([id (in-list  public-field-names)] 
+                          [i (in-naturals)])
+                      (set! tmp-i i)
+                      (hash-set! field-ht id (make-field-info c i)))
+                    (for ([id (in-list neural-field-names)] 
+                          [i (in-naturals (+ tmp-i 1))]) ;; neurals start where the public ones left off   
+                      (hash-set! field-ht id (make-neural-field-info c i)))))
                 
                 ;; -- Extract superclass methods and make rename-inners ---
                 (let ([rename-supers (map (lambda (index mname)
@@ -2631,7 +2758,7 @@
                                                               [new-m (make-method (p m) id)])
                                                          (vector-set! new-vec n new-m)
                                                          (loop (sub1 n) new-m)))
-                                                 (vector-set! int-methods index new-vec))))
+                                                   (vector-set! int-methods index new-vec))))
                                         ;; Under final mode - set extended vtable entry
                                         (let ([v (list->vector (vector->list v))])
                                           (vector-set! super-methods index method)
@@ -2674,7 +2801,7 @@
                                         [blame `(class ,name)])
                                     ;; Store blame information that will be instantiated later
                                     (define ictc-infos (get-interface-contract-info
-                                                         (class-self-interface c) id))
+                                                        (class-self-interface c) id))
                                     (define meth-entry (vector-ref methods index))
                                     (define meth (if (pair? meth-entry)
                                                      (car meth-entry)
@@ -2811,27 +2938,27 @@ An example
   ;; deduplicate the infos we get
   (define dedup-infos
     (let loop ([infos super-infos])
-     (if (null? infos)
-         '()
-         (cons (car infos)
-               (loop (remove* (list (car infos))
-                         (cdr infos)
-                         (λ (i1 i2) (eq? (car i1) (car i2)))))))))
+      (if (null? infos)
+          '()
+          (cons (car infos)
+                (loop (remove* (list (car infos))
+                               (cdr infos)
+                               (λ (i1 i2) (eq? (car i1) (car i2)))))))))
   (define our-ctc (hash-ref (interface-contracts ifc) meth #f))
   (define our-ctcs (hash-keys (interface-contracts ifc)))
   (define our-name `(interface ,(interface-name ifc)))
   (cond ;; if we don't have the contract, the parent's info is fine
-        [(not our-ctc) dedup-infos]
-        ;; if the parent's don't contract it, then it's just our ctc
-        [(null? dedup-infos) (list (list our-ctc our-name #f #f))]
-        ;; our ctc should have a negative party of ourself (for behav. subtyping)
-        [else (cons (list our-ctc our-name #f our-name)
-                    ;; replace occurrences of #f positive blame with this interface
-                    (map (λ (info)
-                            (if (not (caddr info))
-                                (list (car info) (cadr info) our-name (cadddr info))
-                                info))
-                         dedup-infos))]))
+    [(not our-ctc) dedup-infos]
+    ;; if the parent's don't contract it, then it's just our ctc
+    [(null? dedup-infos) (list (list our-ctc our-name #f #f))]
+    ;; our ctc should have a negative party of ourself (for behav. subtyping)
+    [else (cons (list our-ctc our-name #f our-name)
+                ;; replace occurrences of #f positive blame with this interface
+                (map (λ (info)
+                       (if (not (caddr info))
+                           (list (car info) (cadr info) our-name (cadddr info))
+                           info))
+                     dedup-infos))]))
 
 ;; infos bool blame -> infos
 ;; replace either positive or negative parties that are #f with blame
@@ -2905,7 +3032,7 @@ An example
 ;; field-checker    a sealed class is subclassed and should error when a sealed
 ;; method-checker   member is added in the subclass
 (struct seal (sym inst-checker init-checker field-checker method-checker)
-        #:transparent)
+  #:transparent)
 
 (define-values (prop:seals has-seals? get-seals)
   (make-impersonator-property 'class-seals))
@@ -3304,10 +3431,10 @@ An example
         (eq-hash-code obj))))
 
 (define object<%> (let ([object<%>
-			 ((make-naming-constructor struct:interface 'interface:object% #f)
-			  'object% null #f null (hash) (hash) #f null)])
-		    (setup-all-implemented! object<%>)
-		    object<%>))
+                         ((make-naming-constructor struct:interface 'interface:object% #f)
+                          'object% null #f null (hash) (hash) #f null)])
+                    (setup-all-implemented! object<%>)
+                    object<%>))
 
 (define object%
   ((make-naming-constructor struct:class 'object% "class")
@@ -3394,18 +3521,18 @@ An example
   (make-set!-transformer
    (lambda (stx)
      (syntax-case stx ()
-             [id
-              (identifier? #'id)
-              (class-syntax-protect
-               (quasisyntax/loc stx
-                 (make-object/proc (current-contract-region))))]
-             [(_ class arg ...)
-              (class-syntax-protect
-               (quasisyntax/loc stx
-                 (do-make-object
-                  (current-contract-region)
-                  class (list arg ...) (list))))]
-             [(_) (raise-syntax-error 'make-object "expected class" stx)]))))
+       [id
+        (identifier? #'id)
+        (class-syntax-protect
+         (quasisyntax/loc stx
+           (make-object/proc (current-contract-region))))]
+       [(_ class arg ...)
+        (class-syntax-protect
+         (quasisyntax/loc stx
+           (do-make-object
+            (current-contract-region)
+            class (list arg ...) (list))))]
+       [(_) (raise-syntax-error 'make-object "expected class" stx)]))))
 
 (define-syntax (instantiate stx)
   (syntax-case stx ()
@@ -3765,13 +3892,13 @@ An example
    string-append
    (let loop ([args args][count 0])
      (cond
-      [(null? args) null]
-      [(= count 3) '("\n   ...")]
-      [else (let ([rest (loop (cdr args) (add1 count))])
-              (cons (format "\n   [~a ~e]"
-                            (caar args)
-                            (cdar args))
-                    rest))]))))
+       [(null? args) null]
+       [(= count 3) '("\n   ...")]
+       [else (let ([rest (loop (cdr args) (add1 count))])
+               (cons (format "\n   [~a ~e]"
+                             (caar args)
+                             (cdar args))
+                     rest))]))))
 
 (define (unused-args-error this args)
   (let ([arg-string (make-named-arg-string args)])
@@ -4285,6 +4412,53 @@ An example
   (unless (symbol? id) (raise-argument-error 'dynamic-get-field "symbol?" id))
   (do-get-field 'dynamic-get-field id obj))
 
+(define-syntax (access-neural-field! stx)
+  (syntax-case stx ()
+    [(_ name obj)
+     (identifier? #'name)
+     (with-syntax ([localized (localize #'name)])
+       (class-syntax-protect
+        (syntax/loc stx (do-access-neural-field! 'access-neural-field! `localized obj))))] ;; I did not do the /proc intermediate procedure because I do not have a dynamic-access-neural-field!
+    [(_ name obj val)
+     (raise-syntax-error
+      'add-field-watcher! "expected a field name as first argument"
+      stx #'name)]))
+
+(define (do-access-neural-field! who id obj)
+  (define cls-or-object/c-wrapper-info (object-ref obj #f))
+  (cond
+    [(class? cls-or-object/c-wrapper-info)
+     (do-access-neural-field!/raw-object who cls-or-object/c-wrapper-info id obj)]
+    [(object/c-wrapper-info? cls-or-object/c-wrapper-info)
+     (define unwrapped (object/c-wrapper-info-val cls-or-object/c-wrapper-info))
+     (cond
+       [(hash-ref (object/c-wrapper-info-pos-fields cls-or-object/c-wrapper-info) id #f)
+        =>
+        (λ (lnp)
+          (define blame+neg-party (object/c-wrapper-info-blame+neg-party cls-or-object/c-wrapper-info))
+          (define neg-party (cdr blame+neg-party))
+          (define fv (do-access-neural-field! who id unwrapped))
+          (with-contract-continuation-mark
+              blame+neg-party
+            (lnp fv neg-party)))]
+       [else
+        (do-opaque-field-access-check cls-or-object/c-wrapper-info obj id)
+        (do-access-neural-field! who id unwrapped)])]
+    [else
+     (raise-argument-error who
+                           "object?"
+                           obj)]))
+  
+(define (do-access-neural-field!/raw-object who cls id obj)
+  (define field-ht (class-field-ht cls))
+  (define fi (hash-ref field-ht id #f))
+  (if fi
+      ((field-info-neural-field fi) obj)
+      (obj-error who
+                 "given object does not have the requested field"
+                 "field name" (as-write id)
+                 "object" obj)))
+
 (define-syntax (field-bound? stx)
   (syntax-case stx ()
     [(_ name obj)
@@ -4303,10 +4477,10 @@ An example
                           "object?"
                           obj))
   (let loop ([obj obj])
-     (let* ([cls (object-ref/unwrap obj)]
-            [field-ht (class-field-ht cls)])
-       (and (hash-ref field-ht id #f)
-            #t)))) ;; ensure that only #t and #f leak out, not bindings in ht
+    (let* ([cls (object-ref/unwrap obj)]
+           [field-ht (class-field-ht cls)])
+      (and (hash-ref field-ht id #f)
+           #t)))) ;; ensure that only #t and #f leak out, not bindings in ht
 
 (define (field-names obj)
   (unless (object? obj)
@@ -4314,10 +4488,10 @@ An example
                           "object?"
                           obj))
   (let loop ([obj obj])
-     (let* ([cls (object-ref/unwrap obj)]
-            [field-ht (class-field-ht cls)]
-            [flds (filter interned? (hash-map field-ht (lambda (x y) x)))])
-       flds)))
+    (let* ([cls (object-ref/unwrap obj)]
+           [field-ht (class-field-ht cls)]
+           [flds (filter interned? (hash-map field-ht (lambda (x y) x)))])
+      flds)))
 
 (define-syntax (with-method stx)
   (syntax-case stx ()
@@ -4351,7 +4525,7 @@ An example
                                                             (quote-syntax method)
                                                             (quote-syntax method-obj))]
                                                      ...)
-                                                    ()
+                              ()
                               body0 body1 ...))))))]
     ;; Error cases:
     [(_ (clause ...) . body)
@@ -4531,22 +4705,22 @@ An example
 
 (define (object=? o1 o2)
   (cond
-   [(not (object? o1))
-    (raise-argument-error 'object=? "object?" 0 o1 o2)]
-   [(not (object? o2))
-    (raise-argument-error 'object=? "object?" 1 o1 o2)]
-   [else
-    (or (eq? o1 o2) (-object=? o1 o2))]))
+    [(not (object? o1))
+     (raise-argument-error 'object=? "object?" 0 o1 o2)]
+    [(not (object? o2))
+     (raise-argument-error 'object=? "object?" 1 o1 o2)]
+    [else
+     (or (eq? o1 o2) (-object=? o1 o2))]))
 
 (define (object-or-false=? o1 o2)
   (cond
-   [(and o1 (not (object? o1)))
-    (raise-argument-error 'object-or-false=? "(or/c object? #f)" 0 o1 o2)]
-   [(and o2 (not (object? o2)))
-    (raise-argument-error 'object-or-false=? "(or/c object? #f)" 1 o1 o2)]
-   [else
-    (or (eq? o1 o2)
-        (and o1 o2 (-object=? o1 o2)))]))
+    [(and o1 (not (object? o1)))
+     (raise-argument-error 'object-or-false=? "(or/c object? #f)" 0 o1 o2)]
+    [(and o2 (not (object? o2)))
+     (raise-argument-error 'object-or-false=? "(or/c object? #f)" 1 o1 o2)]
+    [else
+     (or (eq? o1 o2)
+         (and o1 o2 (-object=? o1 o2)))]))
 
 (define (-object=? o1 o2)
   (eq? (unwrap-object o1)
@@ -4669,9 +4843,9 @@ An example
    (lambda (x)
      (unless (ormap (lambda (i) (method-in-interface? x i)) from-ids)
        (obj-error 'mixin
-              "method was referenced in definition, but is not in any of the from-interfaces"
-              "method name" (as-write x)
-              "from-interfaces" (as-write-list from-ids))))
+                  "method was referenced in definition, but is not in any of the from-interfaces"
+                  "method name" (as-write x)
+                  "from-interfaces" (as-write-list from-ids))))
    xs))
 
 (define-syntax (mixin stx)
