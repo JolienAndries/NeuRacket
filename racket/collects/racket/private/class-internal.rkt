@@ -95,6 +95,7 @@
               public-final override-final augment-final
               field init init-field init-rest
               neural-field abstract-neural-field augment-neural-field override-neural-field
+              external-neural-field
               rename-super rename-inner inherit inherit/super inherit/inner inherit-field
               this this% super inner
               super-make-object super-instantiate super-new
@@ -255,7 +256,8 @@
  [-neural-field neural-field]
  [-abstract-neural-field abstract-neural-field]
  [-augment-neural-field augment-neural-field]
- [-override-neural-field override-neural-field])
+ [-override-neural-field override-neural-field]
+ [-external-neural-field external-neural-field])
 
 
 (define-for-syntax not-in-a-class
@@ -378,6 +380,7 @@
                 (quote-syntax -abstract-neural-field)
                 (quote-syntax -augment-neural-field)
                 (quote-syntax -override-neural-field)
+                (quote-syntax -external-neural-field)
                 (quote-syntax -private)
                 (quote-syntax -public)
                 (quote-syntax -override)
@@ -472,7 +475,7 @@
                                (if (ormap (lambda (i)
                                             (free-identifier=? (car l) i))
                                           (syntax-e (quote-syntax (-init -init-field -field
-                                                                         -neural-field -abstract-neural-field -augment-neural-field -override-neural-field))))
+                                                                         -neural-field -abstract-neural-field -augment-neural-field -override-neural-field -external-neural-field))))
                                    (cddr l)
                                    (cdr l)))])
                       (if alone
@@ -561,7 +564,7 @@
             ;; ------ Basic syntax checks -----
             (for-each (lambda (stx)
                         (syntax-case stx (-init -init-rest -field -init-field -inherit-field
-                                                -neural-field -abstract-neural-field -augment-neural-field -override-neural-field
+                                                -neural-field -abstract-neural-field -augment-neural-field -override-neural-field -external-neural-field
                                                 -private -public -override -augride
                                                 -public-final -override-final -augment-final
                                                 -pubment -overment -augment
@@ -709,6 +712,20 @@
                                      (syntax->list (syntax (idp ...))))]
                           [(-override-neural-field orig . rest) 
                            (bad "ill-formed override-neural-field clause" #'orig)]
+                          [(-external-neural-field orig idp ...)
+                           ;; idp ... = a ...
+                           (for-each (lambda (idp)
+                                       (syntax-case idp ()
+                                         [(iid eid) (and (identifier? (syntax iid))
+                                                         (identifier? (syntax eid)))]
+                                         [iid (identifier? (syntax iid))]
+                                         [else
+                                          (bad 
+                                           "external-neural-field element is not an optionally renamed identifier-expression pair"
+                                           idp)]))
+                                     (syntax->list (syntax (idp ...))))]
+                          [(-external-neural-field orig . rest) 
+                           (bad "ill-formed external-neural-field clause" #'orig)]
                           [(-private id ...)
                            (for-each
                             (lambda (id)
@@ -867,6 +884,10 @@
                            (flatten #f (extract* (list (quote-syntax -override-neural-field)) exprs))]
                           [(normal-plain-override-neural-fields)   
                            (apply append (map normalize-init/neural-field plain-override-neural-fields))]
+                          [(plain-external-neural-fields)
+                           (flatten #f (extract* (list (quote-syntax -external-neural-field)) exprs))]
+                          [(normal-plain-external-neural-fields)   
+                           (map normalize-init/field plain-external-neural-fields)]
                           [(privates)
                            (flatten pair (extract* (list (quote-syntax -private)) decls))]
                           [(publics)
@@ -945,7 +966,7 @@
               ;; ----- Extract method definitions; check that they look like procs -----
               ;;  Optionally transform them, can expand even if not transforming.
               (let* ([field-names (append (map norm-init/field-iid
-                                               (append normal-plain-fields normal-plain-init-fields))
+                                               (append normal-plain-fields normal-plain-init-fields normal-plain-external-neural-fields))
                                           (map norm-init/neural-field-iid (append normal-plain-neural-fields normal-plain-abstract-neural-fields)))]
                      [inherit-field-names (map car inherit-fields)]
                      [plain-init-names (map norm-init/field-iid normal-plain-inits)]
@@ -1096,7 +1117,7 @@
                       ;; inits
                       (check-dup "init" (map norm-init/field-eid (append normal-inits)))
                       ;; fields
-                      (check-dup "field" (append (map norm-init/field-eid (append normal-plain-fields normal-plain-init-fields))
+                      (check-dup "field" (append (map norm-init/field-eid (append normal-plain-fields normal-plain-init-fields normal-plain-external-neural-fields))
                                                  (map norm-init/neural-field-eid (append normal-plain-neural-fields normal-plain-abstract-neural-fields)))))
                     
                     ;; -- Check that private/public/override/augride are defined --
@@ -1385,6 +1406,42 @@
                                                                                                                                                            [else (error "you can only get or set an override-neural-field")])))))
                                                                                     (syntax->list #'(iid ...)))))]))
                                                             (syntax->list #'(idp ...))))]
+                                          [(-fld orig idp ...)
+                                           (and (identifier? #'-fld)
+                                                (free-identifier=? #'-fld #'-external-neural-field))
+                                           (with-syntax ([(((iid eid))  ...)
+                                                          (map normalize-init/field (syntax->list #'(idp ...)))])
+                                             (syntax-track-origin
+                                              (syntax/loc e (begin 
+                                                              (set! iid (field-initialization-value
+                                                                         (let ((filled-in #f)
+                                                                               (val (box #f))
+                                                                               (changed (box #f))
+                                                                               (hold (box #f))
+                                                                               (input-prev (box #f))
+                                                                               (dispatch (lambda (msg val changed hold input-prev)
+                                                                                           (case msg
+                                                                                             [(get) (lambda () (error "cannot get an external neural field that was not yet initialised"))]
+                                                                                             [(set!) (lambda (new-value) (error "cannot set! an external neural field that was not yet initialised"))]
+                                                                                             [(set-no-trigger!) (lambda (new-value) (error "cannot set! an external neural field that was not yet initialised"))]
+                                                                                             [else (error "you can only get or set a neural-field")]))))
+                                                                           (lambda (msg)
+                                                                             (case msg
+                                                                               [(fill-in-external!)
+                                                                                (lambda (new-dispatch)
+                                                                                  (if filled-in
+                                                                                      (error "cannot fill in an external field twice")
+                                                                                      (begin (set! filled-in #t)
+                                                                                             (set-box! val #f)
+                                                                                             (set-box! changed #f)
+                                                                                             (set! dispatch new-dispatch))))]
+                                                                               [(update-dispatch!)
+                                                                                (lambda (new-dispatch)
+                                                                                  (error "cannot override or augment an external field"))]
+                                                                               [else (dispatch msg val changed hold input-prev)])))))
+                                                              ...))
+                                              e
+                                              #'-fld))]
                                           [(-i-r id/rename)
                                            (and (identifier? #'-i-r) 
                                                 (free-identifier=? #'-i-r #'-init-rest))
@@ -1626,16 +1683,21 @@
                                                           (length plain-init-fields)
                                                           (length plain-fields)
                                                           (length normal-plain-neural-fields)
-                                                          (length normal-plain-abstract-neural-fields)))]
+                                                          (length normal-plain-abstract-neural-fields)
+                                                          (length plain-external-neural-fields)))]
                                           [field-names (map (lambda (norm)
                                                               (lookup-localize (norm-init/field-eid norm)))
                                                             (append
                                                              normal-plain-fields
                                                              normal-plain-init-fields))]
                                           [inherit-field-names (map lookup-localize (map cdr inherit-fields))]
-                                          [neural-field-names (map (lambda (norm) 
-                                                                     (lookup-localize (norm-init/neural-field-eid norm)))
-                                                                   (append normal-plain-neural-fields normal-plain-abstract-neural-fields))]
+                                          [neural-field-names (append (map (lambda (norm) 
+                                                                             (lookup-localize (norm-init/neural-field-eid norm)))
+                                                                           (append normal-plain-neural-fields normal-plain-abstract-neural-fields))
+                                                                      (map (lambda (norm)
+                                                                             (lookup-localize (norm-init/field-eid norm)))
+                                                                            
+                                                                           normal-plain-external-neural-fields))]
                                           [init-names (map (lambda (norm)
                                                              (lookup-localize
                                                               (norm-init/field-eid norm)))
