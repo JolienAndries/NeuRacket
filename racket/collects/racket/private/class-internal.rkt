@@ -65,7 +65,7 @@
               new make-object instantiate dynamic-instantiate
               send send/apply send/keyword-apply send* send+ dynamic-send
               class-field-accessor class-field-mutator with-method
-              get-field set-field! field-bound? field-names
+              get-field set-field! field-bound? field-names set-fields!
               dynamic-get-field dynamic-set-field!
               private* public*  pubment*
               override* overment*
@@ -506,11 +506,308 @@
     (define (normalize-init/neural-field i)
       ;; neural-field : (neural-field ((nrl ...) obj (in ...)) ...) => i : ((nrl ...) obj (in ...))
       (let ((field-names (syntax->list (stx-car i))))
-        (map (normalize-init/field i)
+        (map normalize-init/field
              field-names)))
-    (define ((norm-init/neural-field-iid/def-ctx def-ctx) norm)  (syntax-local-identifier-as-binding (stx-car norm) def-ctx))  
-    (define ((norm-init/neural-field-eid/def-ctx def-ctx) norm)  (syntax-local-identifier-as-binding (stx-car (stx-cdr norm)) def-ctx))
 
+    ;; an extra stx-car at the start around norm, becuase normalize-init/field puts "i in ((iid eid) optional-expr) form"
+    (define ((norm-init/neural-field-iid/def-ctx def-ctx) norm) (syntax-local-identifier-as-binding (stx-car (stx-car norm)) def-ctx))  
+    (define ((norm-init/neural-field-eid/def-ctx def-ctx) norm) (syntax-local-identifier-as-binding (stx-car (stx-cdr (stx-car norm))) def-ctx))
+
+
+    ;;--------------------------------------------------------------------
+    ;;  neural field rewriting
+    ;;--------------------------------------------------------------------
+
+    (define ((rewrite-plain-NF iid-stx-lst in-stx-lst MLo-stx) this-iid)
+      (define replaced-iids (map (lambda (id) (if (free-identifier=? id this-iid)
+                                                  #'(unbox val)
+                                                  #`((#,id 'get))))
+                                 (syntax->list iid-stx-lst)))
+      #`(set! #,this-iid
+              (field-initialization-value
+               (let ((val (box #f))
+                     (changed (box #f))
+                     (hold (box #f))
+                     (input-prev (box #f))
+                     (dispatch
+                      (lambda (msg val changed hold input-prev)
+                        (define (set-val! new-value)
+                          (set-box! changed #t)
+                          (set-box! val new-value))
+                        (case msg
+                          [(get)
+                           (lambda ()
+                             (cond ((and (train-mode) (unbox changed))  (unbox val))
+                                   ((train-mode) (error  "cannot get an unassigned neural field in train mode" #,this-iid))
+                                   ((equal? (unbox input-prev) (list #,@in-stx-lst)) (unbox hold))
+                                   (else (let-values ([#,iid-stx-lst (send #,MLo-stx infer #,@in-stx-lst)])
+                                           (set-box! input-prev (list #,@in-stx-lst))
+                                           (set-box! hold #,this-iid)
+                                           #,this-iid))))]
+                          [(set!)
+                           (lambda (new-value)
+                             (if (train-mode)
+                                 (begin 
+                                   (set-val! new-value)
+                                   (send #,MLo-stx train #,@replaced-iids #,@in-stx-lst))
+                                 (error "cannot assign to a neural field during infer-mode")))]
+                          [(set-no-trigger!)
+                           (lambda (new-value)
+                             (if (train-mode)
+                                 (set-val! new-value)
+                                 (error "cannot assign to a neural field during infer-mode")))]
+                          [(get-input-fields) (lambda () (list #,@in-stx-lst))]
+                          [else (error "can only get or set a neural-field")]))))
+                 (lambda (msg)
+                   (case msg
+                     [(update-dispatch!)
+                      (lambda (new-dispatch)
+                        (set-box! val #f)
+                        (set-box! changed #f)
+                        (set! dispatch new-dispatch))]
+                     [else (dispatch msg val changed hold input-prev)]))))))
+
+    (define ((rewrite-augment-NF iid-stx-lst in-stx-lst MLo-stx) this-iid)
+      (let ((replaced-out-iids (map (lambda (id)  (if (free-identifier=? id this-iid)
+                                                      #'(unbox val)
+                                                      (datum->syntax id `(get-field ,(syntax-e id) this))))
+                                    (syntax->list iid-stx-lst))))
+        #`(let* ((get-input-fields-parent ((access-neural-field!  #,this-iid this) 'get-input-fields))
+                 (get-input-fields (lambda ()
+                                     (append (get-input-fields-parent)
+                                             (list #,@in-stx-lst)))))
+                                                                                          
+            (((access-neural-field!  #,this-iid this) 'update-dispatch!) (lambda (msg val changed hold input-prev)
+                                                                           (define (set-val! new-value)
+                                                                             (set-box! changed #t)
+                                                                             (set-box! val new-value))
+                                                                           (case msg
+                                                                             [(get)  (lambda ()
+                                                                                       (cond ((and (train-mode) (unbox changed)) (unbox val))
+                                                                                             ((train-mode) (error "cannot get an unassigned augment neural field in train mode"))
+                                                                                             ((equal? (unbox input-prev) (list #,@in-stx-lst)) (unbox hold))
+                                                                                             (else (let-values ([#,iid-stx-lst (send/apply #,MLo-stx infer (get-input-fields))])
+                                                                                                     (set-box! input-prev (list #,@in-stx-lst))
+                                                                                                     (set-box! hold #,this-iid)
+                                                                                                     #,this-iid))))]
+                                                                             [(set!) (lambda (new-value)
+                                                                                       (if (train-mode)
+                                                                                           (begin 
+                                                                                             (set-val! new-value)
+                                                                                             (send/apply #,MLo-stx train #,@replaced-out-iids (get-input-fields)))
+                                                                                           (error "cannot assign to an augment neural field during infer-mode")))]
+                                                                             [(set-no-trigger!) (lambda (new-value)
+                                                                                                  (if (train-mode)
+                                                                                                      (set-val! new-value)
+                                                                                                      (error "cannot assign to an augment neural field during infer-mode")))]
+                                                                             [(get-input-fields) get-input-fields]
+                                                                             [else (error "augment-neural-field: unknown message")]))))))
+
+    (define ((rewrite-override-NF iid-stx-lst in-stx-lst MLo-stx) this-iid)
+      (let ((replaced-out-iids (map (lambda (id)
+                                      (if (free-identifier=? id this-iid)
+                                          #'(unbox val)
+                                          (datum->syntax id `(get-field ,(syntax-e id) this))))
+                                    (syntax->list iid-stx-lst))))
+        #`(((access-neural-field!  #,this-iid this) 'update-dispatch!) (lambda (msg val changed hold input-prev)
+                                                                         (define (set-val! new-value)
+                                                                           (set-box! changed #t)
+                                                                           (set-box! val new-value))
+                                                                         (case msg
+                                                                           [(get) (lambda ()
+                                                                                    (cond ((and (train-mode) (unbox changed)) (unbox val))
+                                                                                          ((train-mode) (error "cannot get an unassigned override neural field in train mode"))
+                                                                                          ((equal? (unbox input-prev) (list #,@in-stx-lst)) (unbox hold))
+                                                                                          (else (let-values ([#,iid-stx-lst (send #,MLo-stx infer #,@in-stx-lst)])
+                                                                                                  (set-box! input-prev (list #,@in-stx-lst))
+                                                                                                  (set-box! hold #,this-iid)
+                                                                                                  #,this-iid))))]
+                                                                           [(set!) (lambda (new-value)
+                                                                                     (if (train-mode)
+                                                                                         (begin 
+                                                                                           (set-val! new-value)
+                                                                                           (send #,MLo-stx train #,@replaced-out-iids #,@in-stx-lst))
+                                                                                         (error "cannot assign to a override neural field during infer-mode")))]
+                                                                           [(set-no-trigger!) (lambda (new-value)
+                                                                                                (if (train-mode)
+                                                                                                    (set-val! new-value)
+                                                                                                    (error "cannot assign to a override neural field during infer-mode")))]
+                                                                                                           
+                                                                           [(get-input-fields) (lambda () (list #,@in-stx-lst))]
+                                                                           [else (error "you can only get or set an override-neural-field")])))))
+
+    (define (rewrite-neural-field-general specific-rewrite-function idp-lst)
+      #`(begin #,@(map (lambda (stx)
+                         (syntax-case stx ()
+                           [((out ...) MLo (in ...))
+                            (with-syntax ([[((iid eid)) ...] (map normalize-init/field (syntax->list #'(out ...)))])
+                              #`(begin #,@(map (specific-rewrite-function #'(iid ...) #'(in ...) #'MLo)
+                                               (syntax->list #'(iid ...)))))]))
+                       (syntax->list idp-lst))))
+    
+    #|   (define (rewrite-neural-field stx)
+      (syntax-case stx ()
+        [((out ...) MLo (in ...))
+         (with-syntax ([[((iid eid)) ...] (map normalize-init/field (syntax->list #'(out ...)))])
+           #`(begin #,@(map (lambda (this-iid)
+                              (define replaced-iids (map (lambda (id) (if (free-identifier=? id this-iid)
+                                                                          #'(unbox val)
+                                                                          #`((#,id 'get))))
+                                                         (syntax->list #'(iid ...))))
+                         
+                              #`(set! #,this-iid
+                                      (field-initialization-value
+                                       (let ((val (box #f))
+                                             (changed (box #f))
+                                             (hold (box #f))
+                                             (input-prev (box #f))
+                                             (dispatch
+                                              (lambda (msg val changed hold input-prev)
+                                                (define (set-val! new-value)
+                                                  (set-box! changed #t)
+                                                  (set-box! val new-value))
+                                                (case msg
+                                                  [(get)
+                                                   (lambda ()
+                                                     (cond ((and (train-mode) (unbox changed))  (unbox val))
+                                                           ((train-mode) (error  "cannot get an unassigned neural field in train mode" #,this-iid))
+                                                           ((equal? (unbox input-prev) (list in ...)) (unbox hold))
+                                                           (else (let-values ([(iid ...) (send MLo infer in ...)])
+                                                                   (set-box! input-prev (list in ...))
+                                                                   (set-box! hold #,this-iid)
+                                                                   #,this-iid))))]
+                                                  [(set!)
+                                                   (lambda (new-value)
+                                                     (if (train-mode)
+                                                         (begin 
+                                                           (set-val! new-value)
+                                                           (send MLo train #,@replaced-iids in ...))
+                                                         (error "cannot assign to a neural field during infer-mode")))]
+                                                  [(set-no-trigger!)
+                                                   (lambda (new-value)
+                                                     (if (train-mode)
+                                                         (set-val! new-value)
+                                                         (error "cannot assign to a neural field during infer-mode")))]
+                                                  [(get-input-fields) (lambda () (list in ...))]
+                                                  [else (error "can only get or set a neural-field")]))))
+                                         (lambda (msg)
+                                           (case msg
+                                             [(update-dispatch!)
+                                              (lambda (new-dispatch)
+                                                (set-box! val #f)
+                                                (set-box! changed #f)
+                                                (set! dispatch new-dispatch))]
+                                             [else (dispatch msg val changed hold input-prev)]))))))
+                            (syntax->list #'(iid ...)))))])) |#
+
+    (define (rewrite-abstract-neural-field stx)
+      (syntax-case stx ()
+        [((out ...) (in ...))
+         (with-syntax ([[((iid eid)) ...] (map normalize-init/field (syntax->list #'(out ...)))])
+           #`(begin #,@(map (lambda (this-iid)
+                              #`(set! #,this-iid
+                                      (field-initialization-value
+                                       (let ((val (box #f))
+                                             (changed (box #f))
+                                             (hold (box #f))
+                                             (input-prev (box #f))
+                                             (dispatch (lambda (msg val changed hold input-prev)
+                                                         (case msg
+                                                           [(get) (lambda () (error "cannot get an abstract neural field"))]
+                                                           [(set!) (lambda (new-value) (error "cannot set! an abstract neural field"))]
+                                                           [(set-no-trigger!) (lambda (new-value) (error "cannot set! an abstract neural field"))]
+                                                           [(get-input-fields) (lambda () (list in ...))]
+                                                           [else (error "abstract neural field: unknown message")]))))
+                                         (lambda (msg)
+                                           (case msg
+                                             [(update-dispatch!)
+                                              (lambda (new-dispatch)
+                                                (set-box! val #f)
+                                                (set-box! changed #f)
+                                                (set! dispatch new-dispatch))]
+                                             [else (dispatch msg val changed hold input-prev)]))))))
+                            (syntax->list #'(iid ...)))))]))
+
+    #|  (define (rewrite-augment-neural-field stx)
+      (syntax-case stx ()
+        [((out ...) MLo (in ...))
+         (with-syntax ([[((iid eid)) ...] (map normalize-init/field (syntax->list #'(out ...)))])
+           #`(begin #,@(map (lambda (this-iid)
+                              (let ((replaced-out-iids (map (lambda (id)  (if (free-identifier=? id this-iid)
+                                                                              #'(unbox val)
+                                                                              (datum->syntax id `(get-field ,(syntax-e id) this))))
+                                                            (syntax->list #'(iid ...)))))
+                                #`(let* ((get-input-fields-parent ((access-neural-field!  #,this-iid this) 'get-input-fields))
+                                         (get-input-fields (lambda ()
+                                                             (append (get-input-fields-parent)
+                                                                     (list in ...)))))
+                                                                                          
+                                    (((access-neural-field!  #,this-iid this) 'update-dispatch!) (lambda (msg val changed hold input-prev)
+                                                                                                   (define (set-val! new-value)
+                                                                                                     (set-box! changed #t)
+                                                                                                     (set-box! val new-value))
+                                                                                                   (case msg
+                                                                                                     [(get)  (lambda ()
+                                                                                                               (cond ((and (train-mode) (unbox changed)) (unbox val))
+                                                                                                                     ((train-mode) (error "cannot get an unassigned augment neural field in train mode"))
+                                                                                                                     ((equal? (unbox input-prev) (list in ...)) (unbox hold))
+                                                                                                                     (else (let-values ([(iid ...) (send/apply MLo infer (get-input-fields))])
+                                                                                                                             (set-box! input-prev (list in ...))
+                                                                                                                             (set-box! hold #,this-iid)
+                                                                                                                             #,this-iid))))]
+                                                                                                     [(set!) (lambda (new-value)
+                                                                                                               (if (train-mode)
+                                                                                                                   (begin 
+                                                                                                                     (set-val! new-value)
+                                                                                                                     (send/apply MLo train #,@replaced-out-iids (get-input-fields)))
+                                                                                                                   (error "cannot assign to an augment neural field during infer-mode")))]
+                                                                                                     [(set-no-trigger!) (lambda (new-value)
+                                                                                                                          (if (train-mode)
+                                                                                                                              (set-val! new-value)
+                                                                                                                              (error "cannot assign to an augment neural field during infer-mode")))]
+                                                                                                            
+                                                                                                     [(get-input-fields) get-input-fields]
+                                                                                                     [else (error "augment-neural-field: unknown message")]))))))
+                            (syntax->list #'(iid ...)))))]))
+    |#
+
+    #|  (define (rewrite-override-neural-field stx)
+      (syntax-case stx ()
+        [((out ...) MLo (in ...))
+         (with-syntax ([[((iid eid)) ...] (map normalize-init/field (syntax->list #'(out ...)))])
+                                                            
+           #`(begin #,@(map (lambda (this-iid)
+                              (let ((replaced-out-iids (map (lambda (id) (if (free-identifier=? id this-iid)
+                                                                             #'(unbox val)
+                                                                             (datum->syntax id `(get-field ,(syntax-e id) this))))
+                                                            (syntax->list #'(iid ...)))))
+                                #`(((access-neural-field!  #,this-iid this) 'update-dispatch!) (lambda (msg val changed hold input-prev)
+                                                                                                 (define (set-val! new-value)
+                                                                                                   (set-box! changed #t)
+                                                                                                   (set-box! val new-value))
+                                                                                                 (case msg
+                                                                                                   [(get)  (lambda ()
+                                                                                                             (cond ((and (train-mode) (unbox changed)) (unbox val))
+                                                                                                                   ((train-mode) (error "cannot get an unassigned override neural field in train mode"))
+                                                                                                                   ((equal? (unbox input-prev) (list in ...)) (unbox hold))
+                                                                                                                   (else (let-values ([(iid ...) (send MLo infer in ...)])
+                                                                                                                           (set-box! input-prev (list in ...))
+                                                                                                                           (set-box! hold #,this-iid)
+                                                                                                                           #,this-iid))))]
+                                                                                                   [(set!) (lambda (new-value)
+                                                                                                             (if (train-mode)
+                                                                                                                 (begin 
+                                                                                                                   (set-val! new-value)
+                                                                                                                   (send MLo train #,@replaced-out-iids in ...))
+                                                                                                                 (error "cannot assign to a override neural field during infer-mode")))]
+                                                                                                   [(set-no-trigger!) (lambda (new-value)
+                                                                                                                        (if (train-mode)
+                                                                                                                            (set-val! new-value)
+                                                                                                                            (error "cannot assign to a override neural field during infer-mode")))]
+                                                                                                           
+                                                                                                   [(get-input-fields) (lambda () (list in ...))]
+                                                                                                   [else (error "you can only get or set an override-neural-field")])))))
+                            (syntax->list #'(iid ...)))))])) |#
     
     ;; --------------------------------------------------------------------------------
     ;; Start here:
@@ -876,14 +1173,14 @@
                            (flatten #f (extract* (list (quote-syntax -abstract-neural-field)) exprs))]
                           [(normal-plain-abstract-neural-fields)   
                            (apply append (map normalize-init/neural-field plain-abstract-neural-fields))]
-                          [(plain-augment-neural-fields)   
+                          #|   [(plain-augment-neural-fields)   
                            (flatten #f (extract* (list (quote-syntax -augment-neural-field)) exprs))]
                           [(normal-plain-augment-neural-fields) 
                            (apply append (map normalize-init/neural-field plain-augment-neural-fields))]
                           [(plain-override-neural-fields)    
                            (flatten #f (extract* (list (quote-syntax -override-neural-field)) exprs))]
                           [(normal-plain-override-neural-fields)   
-                           (apply append (map normalize-init/neural-field plain-override-neural-fields))]
+                           (apply append (map normalize-init/neural-field plain-override-neural-fields))] |#
                           [(plain-external-neural-fields)
                            (flatten #f (extract* (list (quote-syntax -external-neural-field)) exprs))]
                           [(normal-plain-external-neural-fields)   
@@ -966,8 +1263,11 @@
               ;; ----- Extract method definitions; check that they look like procs -----
               ;;  Optionally transform them, can expand even if not transforming.
               (let* ([field-names (append (map norm-init/field-iid
-                                               (append normal-plain-fields normal-plain-init-fields normal-plain-external-neural-fields))
-                                          (map norm-init/neural-field-iid (append normal-plain-neural-fields normal-plain-abstract-neural-fields)))]
+                                               (append normal-plain-fields normal-plain-init-fields
+                                                       normal-plain-external-neural-fields))
+                                          (map norm-init/neural-field-iid
+                                               (append normal-plain-neural-fields
+                                                       normal-plain-abstract-neural-fields)))]
                      [inherit-field-names (map car inherit-fields)]
                      [plain-init-names (map norm-init/field-iid normal-plain-inits)]
                      [inherit-names (map car inherits)]
@@ -1117,8 +1417,12 @@
                       ;; inits
                       (check-dup "init" (map norm-init/field-eid (append normal-inits)))
                       ;; fields
-                      (check-dup "field" (append (map norm-init/field-eid (append normal-plain-fields normal-plain-init-fields normal-plain-external-neural-fields))
-                                                 (map norm-init/neural-field-eid (append normal-plain-neural-fields normal-plain-abstract-neural-fields)))))
+                      (check-dup "field" (append (map norm-init/field-eid
+                                                      (append normal-plain-fields normal-plain-init-fields
+                                                              normal-plain-external-neural-fields))
+                                                 (map norm-init/neural-field-eid
+                                                      (append normal-plain-neural-fields
+                                                              normal-plain-abstract-neural-fields)))))
                     
                     ;; -- Check that private/public/override/augride are defined --
                     ;; -- and that abstracts are *not* defined                   --
@@ -1235,211 +1539,67 @@
                                           [(-fld orig idp ...) 
                                            (and (identifier? #'-fld)
                                                 (free-identifier=? #'-fld #'-neural-field))
-                                           #`(begin  #,@(map(lambda (neural-stx)
-                                                              (syntax-case neural-stx ()
-                                                                [((out ...) MLo (in ...))
-                                                                 (with-syntax ([[((iid eid)) ...] (map normalize-init/field (syntax->list #'(out ...)))])
-                                                                   #`(begin #,@(map (lambda (this-iid)
-                                                                                      (let ((replaced-iids (map (lambda (id) (if (free-identifier=? id this-iid)
-                                                                                                                                  #'(unbox val)
-                                                                                                                                  #`((#,id 'get))))
-                                                                                                                 (syntax->list #'(iid ...)))))
-                                                                                        #`(set! #,this-iid
-                                                                                                (field-initialization-value
-                                                                                                 (let ((val (box #f))
-                                                                                                       (changed (box #f))
-                                                                                                       (hold (box #f))
-                                                                                                       (input-prev (box #f))
-                                                                                                       (dispatch
-                                                                                                        (lambda (msg val changed hold input-prev)
-                                                                                                          (define (set-val! new-value)
-                                                                                                            (set-box! changed #t)
-                                                                                                            (set-box! val new-value))
-                                                                                                          (case msg
-                                                                                                            [(get)
-                                                                                                             (lambda ()
-                                                                                                               (cond ((and (train-mode) (unbox changed))  (unbox val))
-                                                                                                                     ((train-mode) (error  "cannot get an unassigned neural field in train mode" #,this-iid))
-                                                                                                                     ((equal? (unbox input-prev) (list in ...)) (unbox hold))
-                                                                                                                     (else (let-values ([(iid ...) (send MLo infer in ...)])
-                                                                                                                             (set-box! input-prev (list in ...))
-                                                                                                                             (set-box! hold #,this-iid)
-                                                                                                                             #,this-iid))))]
-                                                                                                            [(set!)
-                                                                                                             (lambda (new-value)
-                                                                                                               (if (train-mode)
-                                                                                                                   (begin 
-                                                                                                                     (set-val! new-value)
-                                                                                                                     (send MLo train #,@replaced-iids in ...))
-                                                                                                                   (error "cannot assign to a neural field during infer-mode")))]
-                                                                                                            [(set-no-trigger!)
-                                                                                                             (lambda (new-value)
-                                                                                                               (if (train-mode)
-                                                                                                                   (set-val! new-value)
-                                                                                                                   (error "cannot assign to a neural field during infer-mode")))]
-                                                                                                            [(get-input-fields) (lambda () (list in ...))]
-                                                                                                            [else (error "can only get or set a neural-field")]))))
-                                                                                                   (lambda (msg)
-                                                                                                     (case msg
-                                                                                                       [(update-dispatch!)
-                                                                                                        (lambda (new-dispatch)
-                                                                                                          (set-box! val #f)
-                                                                                                          (set-box! changed #f)
-                                                                                                          (set! dispatch new-dispatch))]
-                                                                                                       [else (dispatch msg val changed hold input-prev)])))))))
-                                                                                    (syntax->list #'(iid ...)))))]))
-                                                            (syntax->list #'(idp ...))))]
+                                           (rewrite-neural-field-general rewrite-plain-NF #'(idp ...))]
                                           [(-fld orig idp ...) 
                                            (and (identifier? #'-fld)
                                                 (free-identifier=? #'-fld #'-abstract-neural-field))
-                                           #`(begin #,@(map (lambda (neural-stx)
-                                                              (syntax-case neural-stx ()
-                                                                [((out ...) (in ...))
-                                                                 (with-syntax ([[((iid eid)) ...] (map normalize-init/field (syntax->list #'(out ...)))])
-                                                                   #`(begin #,@(map (lambda (this-iid)
-                                                                                      #`(set! #,this-iid
-                                                                                              (field-initialization-value
-                                                                                               (let ((val (box #f))
-                                                                                                     (changed (box #f))
-                                                                                                     (hold (box #f))
-                                                                                                     (input-prev (box #f))
-                                                                                                     (dispatch (lambda (msg val changed hold input-prev)
-                                                                                                                 (case msg
-                                                                                                                   [(get) (lambda () (error "cannot get an abstract neural field"))]
-                                                                                                                   [(set!) (lambda (new-value) (error "cannot set! an abstract neural field"))]
-                                                                                                                   [(set-no-trigger!) (lambda (new-value) (error "cannot set! an abstract neural field"))]
-                                                                                                                   [(get-input-fields) (lambda () (list in ...))]
-                                                                                                                   [else (error "abstract neural field: unknown message")]))))
-                                                                                                 (lambda (msg)
-                                                                                                   (case msg
-                                                                                                     [(update-dispatch!)
-                                                                                                      (lambda (new-dispatch)
-                                                                                                        (set-box! val #f)
-                                                                                                        (set-box! changed #f)
-                                                                                                        (set! dispatch new-dispatch))]
-                                                                                                     [else (dispatch msg val changed hold input-prev)]))))))
-                                                                                    (syntax->list #'(iid ...)))))]))
+                                           #`(begin #,@(map rewrite-abstract-neural-field
                                                             (syntax->list #'(idp ...))))]
                                           [(-fld orig idp ...) 
                                            (and (identifier? #'-fld)
                                                 (free-identifier=? #'-fld #'-augment-neural-field))
-                                           #`(begin element #,@(map (lambda (neural-stx)
-                                                                      (syntax-case neural-stx ()
-                                                                        [((out ...) MLo (in ...))
-                                                                         (with-syntax ([[((iid eid)) ...] (map normalize-init/field (syntax->list #'(out ...)))])
-                                                                           #`(begin #,@(map (lambda (this-iid)
-                                                                                              (let ((replaced-out-iids (map (lambda (id)  (if (free-identifier=? id this-iid)
-                                                                                                                                              #'(unbox val)
-                                                                                                                                              (datum->syntax id `(get-field ,(syntax-e id) this))))
-                                                                                                                            (syntax->list #'(iid ...)))))
-                                                                                                #`(let* ((get-input-fields-parent ((access-neural-field!  #,this-iid this) 'get-input-fields))
-                                                                                                         (get-input-fields (lambda ()
-                                                                                                                             (append (get-input-fields-parent)
-                                                                                                                                     (list in ...)))))
-                                                                                          
-                                                                                                    (((access-neural-field!  #,this-iid this) 'update-dispatch!) (lambda (msg val changed hold input-prev)
-                                                                                                                                                                   (define (set-val! new-value)
-                                                                                                                                                                     (set-box! changed #t)
-                                                                                                                                                                     (set-box! val new-value))
-                                                                                                                                                                   (case msg
-                                                                                                                                                                     [(get)  (lambda ()
-                                                                                                                                                                               (cond ((and (train-mode) (unbox changed)) (unbox val))
-                                                                                                                                                                                     ((train-mode) (error "cannot get an unassigned augment neural field in train mode"))
-                                                                                                                                                                                     ((equal? (unbox input-prev) (list in ...)) (unbox hold))
-                                                                                                                                                                                     (else (let-values ([(iid ...) (send/apply MLo infer (get-input-fields))])
-                                                                                                                                                                                             (set-box! input-prev (list in ...))
-                                                                                                                                                                                             (set-box! hold #,this-iid)
-                                                                                                                                                                                             #,this-iid))))]
-                                                                                                                                                                     [(set!) (lambda (new-value)
-                                                                                                                                                                               (if (train-mode)
-                                                                                                                                                                                   (begin 
-                                                                                                                                                                                     (set-val! new-value)
-                                                                                                                                                                                     (send/apply MLo train #,@replaced-out-iids (get-input-fields)))
-                                                                                                                                                                                   (error "cannot assign to an augment neural field during infer-mode")))]
-                                                                                                                                                                     [(set-no-trigger!) (lambda (new-value)
-                                                                                                                                                                                          (if (train-mode)
-                                                                                                                                                                                              (set-val! new-value)
-                                                                                                                                                                                              (error "cannot assign to an augment neural field during infer-mode")))]
-                                                                                                            
-                                                                                                                                                                     [(get-input-fields) get-input-fields]
-                                                                                                                                                                     [else (error "augment-neural-field: unknown message")]))))))
-                                                                                            (syntax->list #'(iid ...)))))]))
-                                                                    (syntax->list #'(idp ...))))]
+                                           ;; #`(begin #,@(map rewrite-augment-neural-field (syntax->list #'(idp ...))))
+                                           (rewrite-neural-field-general rewrite-augment-NF #'(idp ...))]
                                           [(-fld orig idp ...) 
                                            (and (identifier? #'-fld)
                                                 (free-identifier=? #'-fld #'-override-neural-field))
-                                           #`(begin #,@(map (lambda (neural-stx)
-                                                              (syntax-case neural-stx ()
-                                                                [((out ...) MLo (in ...))
-                                                                 (with-syntax ([[((iid eid)) ...] (map normalize-init/field (syntax->list #'(out ...)))])
-                                                            
-                                                                   #`(begin #,@(map (lambda (this-iid)
-                                                                                      (let ((replaced-out-iids (map (lambda (id) (if (free-identifier=? id this-iid)
-                                                                                                                                     #'(unbox val)
-                                                                                                                                     (datum->syntax id `(get-field ,(syntax-e id) this))))
-                                                                                                                    (syntax->list #'(iid ...)))))
-                                                                                        #`(((access-neural-field!  #,this-iid this) 'update-dispatch!) (lambda (msg val changed hold input-prev)
-                                                                                                                                                         (define (set-val! new-value)
-                                                                                                                                                           (set-box! changed #t)
-                                                                                                                                                           (set-box! val new-value))
-                                                                                                                                                         (case msg
-                                                                                                                                                           [(get)  (lambda ()
-                                                                                                                                                                     (cond ((and (train-mode) (unbox changed)) (unbox val))
-                                                                                                                                                                           ((train-mode) (error "cannot get an unassigned override neural field in train mode"))
-                                                                                                                                                                           ((equal? (unbox input-prev) (list in ...)) (unbox hold))
-                                                                                                                                                                           (else (let-values ([(iid ...) (send MLo infer in ...)])
-                                                                                                                                                                                   (set-box! input-prev (list in ...))
-                                                                                                                                                                                   (set-box! hold #,this-iid)
-                                                                                                                                                                                   #,this-iid))))]
-                                                                                                                                                           [(set!) (lambda (new-value)
-                                                                                                                                                                     (if (train-mode)
-                                                                                                                                                                         (begin 
-                                                                                                                                                                           (set-val! new-value)
-                                                                                                                                                                           (send MLo train #,@replaced-out-iids in ...))
-                                                                                                                                                                         (error "cannot assign to a override neural field during infer-mode")))]
-                                                                                                                                                           [(set-no-trigger!) (lambda (new-value)
-                                                                                                                                                                                (if (train-mode)
-                                                                                                                                                                                    (set-val! new-value)
-                                                                                                                                                                                    (error "cannot assign to a override neural field during infer-mode")))]
-                                                                                                           
-                                                                                                                                                           [(get-input-fields) (lambda () (list in ...))]
-                                                                                                                                                           [else (error "you can only get or set an override-neural-field")])))))
-                                                                                    (syntax->list #'(iid ...)))))]))
-                                                            (syntax->list #'(idp ...))))]
+                                           ;; #`(begin #,@(map rewrite-override-neural-field (syntax->list #'(idp ...))))
+                                           (rewrite-neural-field-general rewrite-override-NF #'(idp ...))]
                                           [(-fld orig idp ...)
                                            (and (identifier? #'-fld)
                                                 (free-identifier=? #'-fld #'-external-neural-field))
                                            (with-syntax ([(((iid eid))  ...)
                                                           (map normalize-init/field (syntax->list #'(idp ...)))])
                                              (syntax-track-origin
-                                              (syntax/loc e (begin 
-                                                              (set! iid (field-initialization-value
-                                                                         (let ((filled-in #f)
-                                                                               (val (box #f))
-                                                                               (changed (box #f))
-                                                                               (hold (box #f))
-                                                                               (input-prev (box #f))
-                                                                               (dispatch (lambda (msg val changed hold input-prev)
-                                                                                           (case msg
-                                                                                             [(get) (lambda () (error "cannot get an external neural field that was not yet initialised"))]
-                                                                                             [(set!) (lambda (new-value) (error "cannot set! an external neural field that was not yet initialised"))]
-                                                                                             [(set-no-trigger!) (lambda (new-value) (error "cannot set! an external neural field that was not yet initialised"))]
-                                                                                             [else (error "you can only get or set a neural-field")]))))
-                                                                           (lambda (msg)
-                                                                             (case msg
-                                                                               [(fill-in-external!)
-                                                                                (lambda (new-dispatch)
-                                                                                  (if filled-in
-                                                                                      (error "cannot fill in an external field twice")
-                                                                                      (begin (set! filled-in #t)
-                                                                                             (set-box! val #f)
-                                                                                             (set-box! changed #f)
-                                                                                             (set! dispatch new-dispatch))))]
-                                                                               [(update-dispatch!)
-                                                                                (lambda (new-dispatch)
-                                                                                  (error "cannot override or augment an external field"))]
-                                                                               [else (dispatch msg val changed hold input-prev)])))))
-                                                              ...))
+                                              (syntax/loc e
+                                                (begin 
+                                                  (set!
+                                                   iid
+                                                   (field-initialization-value
+                                                    (let ((filled-in #f)
+                                                          (val (box #f))
+                                                          (changed (box #f))
+                                                          (hold (box #f))
+                                                          (input-prev (box #f))
+                                                          (dispatch
+                                                           (lambda (msg val changed hold input-prev)
+                                                             (case msg
+                                                               [(get)
+                                                                (lambda ()
+                                                                  (error "cannot get an external neural field that was not yet initialised"))]
+                                                               [(set!)
+                                                                (lambda (new-value)
+                                                                  (error "cannot set! an external neural field that was not yet initialised"))]
+                                                               [(set-no-trigger!)
+                                                                (lambda (new-value)
+                                                                  (error "cannot set! an external neural field that was not yet initialised"))]
+                                                               [else
+                                                                (error "you can only get or set a neural-field")]))))
+                                                      (lambda (msg)
+                                                        (case msg
+                                                          [(fill-in-external!)
+                                                           (lambda (new-dispatch)
+                                                             (if filled-in
+                                                                 (error "cannot fill in an external field twice")
+                                                                 (begin (set! filled-in #t)
+                                                                        (set-box! val #f)
+                                                                        (set-box! changed #f)
+                                                                        (set! dispatch new-dispatch))))]
+                                                          [(update-dispatch!)
+                                                           (lambda (new-dispatch)
+                                                             (error "cannot override or augment an external field"))]
+                                                          [else (dispatch msg val changed hold input-prev)])))))
+                                                  ...))
                                               e
                                               #'-fld))]
                                           [(-i-r id/rename)
@@ -1696,7 +1856,6 @@
                                                                            (append normal-plain-neural-fields normal-plain-abstract-neural-fields))
                                                                       (map (lambda (norm)
                                                                              (lookup-localize (norm-init/field-eid norm)))
-                                                                            
                                                                            normal-plain-external-neural-fields))]
                                           [init-names (map (lambda (norm)
                                                              (lookup-localize
@@ -5361,7 +5520,7 @@ An example
          get-field set-field! field-bound? field-names
          set-fields!
          dynamic-get-field dynamic-set-field!
-            set-fields! begin-train defneuralslice new-neural-slice
+         begin-train defneuralslice new-neural-slice
          send send/apply send/keyword-apply send* send+ dynamic-send
          class-field-accessor class-field-mutator with-method
          private* public*  pubment*
