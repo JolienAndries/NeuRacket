@@ -36,31 +36,27 @@
                     (super-new)))
 
 
-
+(define-for-syntax (get-param lst-stx)
+  (flatten (map (lambda (stx)
+                  (let ((param (syntax->datum stx)))
+                    (if (list? param)
+                        (map (lambda (el) (datum->syntax stx el)) (cdr param)) ;; stx is the context
+                        stx)))
+                (syntax->list lst-stx))))
 
 (define-syntax defMLObject
   (lambda (stx)
-    (syntax-case stx (file infer train input label post-processing)
+    (syntax-case stx (file infer train input label output)
       [(_ obj-name
           [file file-name]
           [infer infer-name]
           [train train-name]
-          [input arg ...]
-          [label output ...]
+          [input in ...]
+          [label lbl ...]
           rest-body ...)
   
-       (with-syntax ([(input-param ...) (flatten (map (lambda (stx)
-                                                        (let ((param (syntax->datum stx)))
-                                                          (if (list? param)
-                                                              (map (lambda (el) (datum->syntax stx el)) (cdr param)) ;; stx is the context
-                                                              stx)))
-                                                      (syntax->list #'(arg ...))))]
-                     [(output-param ...) (flatten (map (lambda (stx)
-                                                         (let ((param (syntax->datum stx)))
-                                                           (if (list? param)
-                                                               (map (lambda (el) (datum->syntax stx el)) (cdr param)) ;; stx is the context
-                                                               stx)))
-                                                       (syntax->list #'(output ...))))])
+       (with-syntax ([(input-param ...) (get-param #'(in ...))]
+                     [(label-param ...) (get-param #'(lbl ...))])
          #`(define obj-name
              (new (class MLclass%
 
@@ -68,11 +64,12 @@
                     (define python-train (run train-name))
                     (define python-infer (run infer-name))
 
-                    (define/override (train output-param ... input-param ...)
-                      (apply python-train (map racket->python (list output ... arg ...))))
+                    (define/override (train label-param ... input-param ...)
+                      (apply python-train (map racket->python (list lbl ... in ...))))
+                    
 
                     (define/override (infer input-param ...)
-                      (output->values (python->racket (apply python-infer (map racket->python (list arg ...))))))
+                      (output->values (python->racket (apply python-infer (map racket->python (list in ...))))))
 
                     rest-body ...
                     (super-new)))))]
@@ -80,15 +77,14 @@
           [file file-name]
           [infer infer-name]
           [train train-name]
-          [input arg ...]
-          [label output ...]
-          ;;   [post-processing post-func ...]
+          [input in ...]
+          [label lbl ...]
+          [output out ...]
           rest-body ...)
-
-       (with-syntax ([(input-param ...) (flatten (map (lambda (param)
-                                                        (if (list? param) (cdr param) param)) (syntax->list #'(arg ...))))]
-                     [(output-param ...) (flatten (map (lambda (param)
-                                                         (if (list? param) (cdr param) param)) (syntax->list #'(output ...))))])
+  
+       (with-syntax ([(input-param ...) (get-param #'(in ...))]
+                     [(label-param ...) (get-param #'(lbl ...))]
+                     [(output-param ...) (get-param #'(out ...))])
          #`(define obj-name
              (new (class MLclass%
 
@@ -96,11 +92,17 @@
                     (define python-train (run train-name))
                     (define python-infer (run infer-name))
 
-                    (define/override (train input-param ... output-param ...)
-                      (apply python-train (map racket->python '(arg ... output ...))))
+                    (define/private (post-process output-param ...)
+                      (values out ...))
+
+                    (define/override (train label-param ... input-param ...)
+                      (apply python-train (map racket->python (list lbl ... in ...))))
+                    
 
                     (define/override (infer input-param ...)
-                      (python->racket (apply python-infer (map racket->python '(arg ...)))))
+                      (call-with-values (lambda ()
+                                          (output->values (python->racket (apply python-infer (map racket->python (list in ...))))))
+                                        post-process))
 
                     rest-body ...
                     (super-new)))))])))
