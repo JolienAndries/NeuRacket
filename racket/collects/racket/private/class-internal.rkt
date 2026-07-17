@@ -94,7 +94,7 @@
               pubment overment augride
               public-final override-final augment-final
               field init init-field init-rest
-              neural-field abstract-neural-field augment-neural-field override-neural-field
+              neural-field abstract-neural-field augment-neural-field override-neural-field label-field
               external-neural-field begin-train defneuralslice new-neural-slice 
               rename-super rename-inner inherit inherit/super inherit/inner inherit-field
               this this% super inner
@@ -257,7 +257,8 @@
  [-abstract-neural-field abstract-neural-field]
  [-augment-neural-field augment-neural-field]
  [-override-neural-field override-neural-field]
- [-external-neural-field external-neural-field])
+ [-external-neural-field external-neural-field]
+ [-label-field label-field])
 
 
 (define-for-syntax not-in-a-class
@@ -381,6 +382,7 @@
                 (quote-syntax -augment-neural-field)
                 (quote-syntax -override-neural-field)
                 (quote-syntax -external-neural-field)
+                (quote-syntax -label-field)
                 (quote-syntax -private)
                 (quote-syntax -public)
                 (quote-syntax -override)
@@ -475,7 +477,8 @@
                                (if (ormap (lambda (i)
                                             (free-identifier=? (car l) i))
                                           (syntax-e (quote-syntax (-init -init-field -field
-                                                                         -neural-field -abstract-neural-field -augment-neural-field -override-neural-field -external-neural-field))))
+                                                                         -neural-field -abstract-neural-field -augment-neural-field
+                                                                         -override-neural-field -external-neural-field -label-field))))
                                    (cddr l)
                                    (cdr l)))])
                       (if alone
@@ -861,7 +864,8 @@
             ;; ------ Basic syntax checks -----
             (for-each (lambda (stx)
                         (syntax-case stx (-init -init-rest -field -init-field -inherit-field
-                                                -neural-field -abstract-neural-field -augment-neural-field -override-neural-field -external-neural-field
+                                                -neural-field -abstract-neural-field -augment-neural-field
+                                                -override-neural-field -external-neural-field -label-field
                                                 -private -public -override -augride
                                                 -public-final -override-final -augment-final
                                                 -pubment -overment -augment
@@ -1023,6 +1027,20 @@
                                      (syntax->list (syntax (idp ...))))]
                           [(-external-neural-field orig . rest) 
                            (bad "ill-formed external-neural-field clause" #'orig)]
+                          [(-label-field orig idp ...)
+                           (for-each (lambda (idp)
+                                       (syntax-case idp ()
+                                         [(id expr) (identifier? (syntax id)) 'ok]
+                                         [((iid eid) expr) (and (identifier? (syntax iid))
+                                                                (identifier? (syntax eid)))
+                                                           'ok]
+                                         [else
+                                          (bad 
+                                           "label-field element is not an optionally renamed identifier-expression pair"
+                                           idp)]))
+                                     (syntax->list (syntax (idp ...))))]
+                          [(-label-field orig . rest)
+                           (bad "ill-formed label-field clause" #'orig)]
                           [(-private id ...)
                            (for-each
                             (lambda (id)
@@ -1185,6 +1203,10 @@
                            (flatten #f (extract* (list (quote-syntax -external-neural-field)) exprs))]
                           [(normal-plain-external-neural-fields)   
                            (map normalize-init/field plain-external-neural-fields)]
+                          [(plain-label-fields)
+                           (flatten #f (extract* (list (quote-syntax -label-field)) exprs))]
+                          [(normal-plain-label-fields)   
+                           (map normalize-init/field plain-label-fields)]
                           [(privates)
                            (flatten pair (extract* (list (quote-syntax -private)) decls))]
                           [(publics)
@@ -1264,7 +1286,7 @@
               ;;  Optionally transform them, can expand even if not transforming.
               (let* ([field-names (append (map norm-init/field-iid
                                                (append normal-plain-fields normal-plain-init-fields
-                                                       normal-plain-external-neural-fields))
+                                                       normal-plain-external-neural-fields normal-plain-label-fields))
                                           (map norm-init/neural-field-iid
                                                (append normal-plain-neural-fields
                                                        normal-plain-abstract-neural-fields)))]
@@ -1419,7 +1441,7 @@
                       ;; fields
                       (check-dup "field" (append (map norm-init/field-eid
                                                       (append normal-plain-fields normal-plain-init-fields
-                                                              normal-plain-external-neural-fields))
+                                                              normal-plain-external-neural-fields normal-plain-label-fields))
                                                  (map norm-init/neural-field-eid
                                                       (append normal-plain-neural-fields
                                                               normal-plain-abstract-neural-fields)))))
@@ -1599,6 +1621,35 @@
                                                            (lambda (new-dispatch)
                                                              (error "cannot override or augment an external field"))]
                                                           [else (dispatch msg val changed hold input-prev)])))))
+                                                  ...))
+                                              e
+                                              #'-fld))]
+                                          [(-fld orig idp ...)
+                                           (and (identifier? #'-fld)
+                                                (free-identifier=? #'-fld #'-label-field))
+                                           (with-syntax ([(((iid eid) expr) ...)
+                                                          (map normalize-init/field (syntax->list #'(idp ...)))])
+                                             (syntax-track-origin
+                                              (syntax/loc e
+                                                (begin
+                                                  (set! iid (field-initialization-value
+                                                             (let ((value expr)
+                                                                   (mlobj #f)
+                                                                   (train #f))
+                                                               (lambda (msg . args)
+                                                                 (case msg
+                                                                   [(get) (lambda () value)]
+                                                                   [(set!)
+                                                                    (lambda (new-value)
+                                                                      (set! value new-value)
+                                                                      (when mlobj (train value)))]
+                                                                   [(set-mlobj!)
+                                                                    (cond (mlobj (error "cannot couple multiple MLObjects to a label field"))
+                                                                          ((= (length args) 2)
+                                                                           (set! mlobj (car args))
+                                                                           (set! train (cadr args)))
+                                                                          (else (error "wrong number of arguments for coupling MLObject to label field, needed two, given" args)))]
+                                                                   [else (error "unknown message for label-field" msg)])))))
                                                   ...))
                                               e
                                               #'-fld))]
@@ -1844,7 +1895,8 @@
                                                           (length plain-fields)
                                                           (length normal-plain-neural-fields)
                                                           (length normal-plain-abstract-neural-fields)
-                                                          (length plain-external-neural-fields)))]
+                                                          (length plain-external-neural-fields)
+                                                          (length plain-label-fields)))]
                                           [field-names (map (lambda (norm)
                                                               (lookup-localize (norm-init/field-eid norm)))
                                                             (append
@@ -1856,7 +1908,7 @@
                                                                            (append normal-plain-neural-fields normal-plain-abstract-neural-fields))
                                                                       (map (lambda (norm)
                                                                              (lookup-localize (norm-init/field-eid norm)))
-                                                                           normal-plain-external-neural-fields))]
+                                                                           (append normal-plain-external-neural-fields normal-plain-label-fields)))]
                                           [init-names (map (lambda (norm)
                                                              (lookup-localize
                                                               (norm-init/field-eid norm)))
@@ -5456,38 +5508,88 @@ An example
 
 (define-syntax defneuralslice
   (lambda (stx)
-    (syntax-case stx (using-objects target-fields input-fields MLObject)
+    (syntax-case stx (using-objects target-fields input-fields MLObject label-fields)
       [(_ (slice-name obj-name ...)
           [target-fields [target-obj target-field] ...]
           [input-fields [input-obj input-field] ...]
           [MLObject MLo])
 
        #`(define (slice-name obj-name ...)
-           (((access-neural-field! target-field target-obj) 'fill-in-external!) (lambda (msg val changed hold input-prev)
-                                                                                  (define (set-val! new-value)
-                                                                                    (set-box! changed #t)
-                                                                                    (set-box! val new-value))
-                                                                                  (case msg
-                                                                                    [(get)  (lambda ()
-                                                                                              (cond ((and (train-mode) (unbox changed)) (unbox val))
-                                                                                                    ((train-mode) (error "cannot get an unassigned external neural field in train mode"))
-                                                                                                    ((equal? (unbox input-prev) (list (get-field input-field input-obj) ...)) (unbox hold))
-                                                                                                    (else (let-values ([(target-field ...) (send MLo infer (get-field input-field input-obj) ...)])
-                                                                                                            (set-box! input-prev (list (get-field input-field input-obj) ...))
-                                                                                                            (set-box! hold target-field)
-                                                                                                            target-field))))] 
-                                                                                    [(set!) (lambda (new-value)
-                                                                                              (if (train-mode)
-                                                                                                  (begin 
-                                                                                                    (set-val! new-value)
-                                                                                                    (send MLo train (get-field target-field target-obj) ... (get-field input-field input-obj) ...))
-                                                                                                  (error "cannot assign to an external neural field during infer-mode")))]
-                                                                                    [(set-no-trigger!) (lambda (new-value)
-                                                                                                         (if (train-mode)
-                                                                                                             (set-val! new-value)
-                                                                                                             (error "cannot assign to an external neural field during infer-mode")))]
-                                                                                    [else (error "you can only get or set an external-neural-field")])))
-           ...)])))
+           (((access-neural-field! target-field target-obj) 'fill-in-external!)
+            (lambda (msg val changed hold input-prev)
+              (define (set-val! new-value)
+                (set-box! changed #t)
+                (set-box! val new-value))
+              (case msg
+                [(get)
+                 (lambda ()
+                   (cond ((and (train-mode) (unbox changed))
+                          (unbox val))
+                         ((train-mode)
+                          (error "cannot get an unassigned external neural field in train mode"))
+                         ((equal? (unbox input-prev) (list (get-field input-field input-obj) ...))
+                          (unbox hold))
+                         (else
+                          (let-values ([(target-field ...) (send MLo infer (get-field input-field input-obj) ...)])
+                            (set-box! input-prev (list (get-field input-field input-obj) ...))
+                            (set-box! hold target-field)
+                            target-field))))] 
+                [(set!)
+                 (lambda (new-value)
+                   (if (train-mode)
+                       (begin (set-val! new-value)
+                              (send MLo train (get-field target-field target-obj) ... (get-field input-field input-obj) ...))
+                       (error "cannot assign to an external neural field during infer-mode")))]
+                [(set-no-trigger!)
+                 (lambda (new-value)
+                   (if (train-mode)
+                       (set-val! new-value)
+                       (error "cannot assign to an external neural field during infer-mode")))]
+                [else (error "you can only get or set an external-neural-field")])))
+           ...)]
+      [(_ (slice-name obj-name ...)
+          [target-fields [target-obj target-field] ...]
+          [input-fields [input-obj input-field] ...]
+          [MLObject MLo]
+          [label-fields [label-obj label-field] ...])
+       (with-syntax (([label-func ...]
+                      (for/list ([obj (syntax->list #'(label-obj ...))]
+                                 [label (syntax->list #'(label-field ...))])
+                        (define replaced (map (lambda (curr-obj curr-label)
+                                                (if (and (free-identifier=? curr-obj obj)
+                                                         (free-identifier=? curr-label label))
+                                                    #'this-value
+                                                    #`(get-field #,curr-label #,curr-obj)))
+                                              (syntax->list #'(label-obj ...))
+                                              (syntax->list #'(label-field ...))))
+                        #`((access-neural-field! #,label #,obj)
+                           'set-mlobj! MLo (lambda (this-value)
+                                             (send MLo train #,@replaced (get-field input-field input-obj) ...))))))
+         #`(define (slice-name obj-name ...)
+             (((access-neural-field! target-field target-obj) 'fill-in-external!)
+              (lambda (msg val changed hold input-prev)
+                (define (set-val! new-value)
+                  (set-box! changed #t)
+                  (set-box! val new-value))
+                (case msg
+                  [(get)
+                   (lambda ()
+                     (cond ((and (train-mode) (unbox changed)) (unbox val))
+                           ((train-mode) (error "cannot get an unassigned external neural field in train mode"))
+                           ((equal? (unbox input-prev) (list (get-field input-field input-obj) ...)) (unbox hold))
+                           (else (let-values ([(target-field ...) (send MLo infer (get-field input-field input-obj) ...)])
+                                   (set-box! input-prev (list (get-field input-field input-obj) ...))
+                                   (set-box! hold target-field)
+                                   target-field))))] 
+                  [(set!)
+                   (lambda (new-value)
+                     (error "cannot assign to a neural field that has a label field"))]
+                  [(set-no-trigger!) (lambda (new-value)
+                                       (error "cannot assign to a neural field that has a label field"))]
+                  [else (error "you can only get or set an external-neural-field")])))
+             ...
+             
+             label-func ...))])))
 
 (define train-mode (make-parameter #f))
 (define-syntax (begin-train stx)
