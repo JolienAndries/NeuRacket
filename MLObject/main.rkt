@@ -19,9 +19,9 @@
 
 (define (racket->python value)
   (cond ((string? value) (string->pystring value))
-        ((vector? value)  (vector->pytuple (vector-map racket->python value)))
-        ((list? value)  (list->pylist (map racket->python value)))
-        ((hash? value) (hash->pydict (hash-map/copy value (lambda (k v) (values (racket->python k) (racket->python v))))))
+        ((vector? value) (vector->pytuple (vector-map racket->python value)))
+        ((list? value)   (list->pylist (map racket->python value)))
+        ((hash? value)   (hash->pydict (hash-map/copy value (lambda (k v) (values (racket->python k) (racket->python v))))))
         (else value)))
 
 (define (output->values output)
@@ -52,8 +52,7 @@
           [infer infer-name]
           [train train-name]
           [input in ...]
-          [label lbl ...]
-          rest-body ...)
+          [label lbl ...])
   
        (with-syntax ([(input-param ...) (get-param #'(in ...))]
                      [(label-param ...) (get-param #'(lbl ...))])
@@ -79,8 +78,7 @@
           [train train-name]
           [input in ...]
           [label lbl ...]
-          [output out ...]
-          rest-body ...)
+          [output out ...])
   
        (with-syntax ([(input-param ...) (get-param #'(in ...))]
                      [(label-param ...) (get-param #'(lbl ...))]
