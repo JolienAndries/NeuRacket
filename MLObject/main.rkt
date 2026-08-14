@@ -1,6 +1,6 @@
 #lang racket/base
 
-(require (for-syntax racket/base (only-in racket/list flatten)) (only-in racket/vector vector-map) 
+(require (for-syntax racket/base (only-in racket/list flatten remove-duplicates)) (only-in racket/vector vector-map) 
          racket/class (only-in racket/function identity))
 (provide defMLObject identity)
 
@@ -37,12 +37,14 @@
 
 
 (define-for-syntax (get-param lst-stx)
-  (flatten (map (lambda (stx)
-                  (let ((param (syntax->datum stx)))
-                    (if (list? param)
-                        (map (lambda (el) (datum->syntax stx el)) (cdr param)) ;; stx is the context
-                        stx)))
-                (syntax->list lst-stx))))
+  (remove-duplicates (flatten (map (lambda (stx)
+                                     (let ((param (syntax->datum stx)))
+                                       (if (list? param)
+                                           (map (lambda (el) (datum->syntax stx el)) (cdr param)) ;; stx is the context
+                                           stx)))
+                                   (syntax->list lst-stx)))
+                     free-identifier=?))
+
 
 (define-syntax defMLObject
   (lambda (stx)
@@ -54,8 +56,8 @@
           [input in ...]
           [label lbl ...])
   
-       (with-syntax ([(input-param ...) (get-param #'(in ...))]
-                     [(label-param ...) (get-param #'(lbl ...))])
+       (with-syntax ([(infer-param ...) (get-param #'(in ...))]
+                     [(train-param ...) (get-param #'(lbl ... in ...))])
          #`(define obj-name
              (new (class MLclass%
 
@@ -63,14 +65,12 @@
                     (define python-train (run train-name))
                     (define python-infer (run infer-name))
 
-                    (define/override (train label-param ... input-param ...)
+                    (define/override (train train-param ...)
                       (apply python-train (map racket->python (list lbl ... in ...))))
                     
 
-                    (define/override (infer input-param ...)
+                    (define/override (infer infer-param ...)
                       (output->values (python->racket (apply python-infer (map racket->python (list in ...))))))
-
-                    rest-body ...
                     (super-new)))))]
       [(_ obj-name
           [file file-name]
@@ -80,9 +80,9 @@
           [label lbl ...]
           [output out ...])
   
-       (with-syntax ([(input-param ...) (get-param #'(in ...))]
-                     [(label-param ...) (get-param #'(lbl ...))]
-                     [(output-param ...) (get-param #'(out ...))])
+       (with-syntax ([(infer-param ...) (get-param #'(in ...))]
+                     [(train-param ...) (get-param #'(lbl ... in ...))]
+                     [(post-param ...) (get-param #'(out ...))])
          #`(define obj-name
              (new (class MLclass%
 
@@ -90,17 +90,74 @@
                     (define python-train (run train-name))
                     (define python-infer (run infer-name))
 
-                    (define/private (post-process output-param ...)
+                    (define (post-process post-param ...) ;; cannot be a method because used with call-with-values
                       (values out ...))
 
-                    (define/override (train label-param ... input-param ...)
+                    (define/override (train train-param ...)
                       (apply python-train (map racket->python (list lbl ... in ...))))
                     
 
-                    (define/override (infer input-param ...)
+                    (define/override (infer infer-param ...)
                       (call-with-values (lambda ()
                                           (output->values (python->racket (apply python-infer (map racket->python (list in ...))))))
                                         post-process))
 
-                    rest-body ...
+                    (super-new)))))]
+      [(_ obj-name
+          [file file-name]
+          [infer infer-name]
+          [train train-name]
+          [input in ...]
+          [label lbl ...]
+          [guard guard-expr])
+  
+       (with-syntax ([(infer-param ...) (get-param #'(in ...))]
+                     [(train-param ...) (get-param #'(lbl ... in ...))])
+         #`(define obj-name
+             (new (class MLclass%
+
+                    (run* (string-append "with open('" file-name "') as file: exec(file.read())"))
+                    (define python-train (run train-name))
+                    (define python-infer (run infer-name))
+
+                    (define/override (train train-param ...)
+                      (when guard-expr
+                        (apply python-train (map racket->python (list lbl ... in ...)))))
+                    
+
+                    (define/override (infer infer-param ...)
+                      (output->values (python->racket (apply python-infer (map racket->python (list in ...))))))
+                    (super-new)))))]
+      [(_ obj-name
+          [file file-name]
+          [infer infer-name]
+          [train train-name]
+          [input in ...]
+          [label lbl ...]
+          [guard guard-expr]
+          [output out ...])
+  
+       (with-syntax ([(infer-param ...) (get-param #'(in ...))]
+                     [(train-param ...) (get-param #'(lbl ... in ...))]
+                     [(post-param ...) (get-param #'(out ...))])
+         #`(define obj-name
+             (new (class MLclass%
+
+                    (run* (string-append "with open('" file-name "') as file: exec(file.read())"))
+                    (define python-train (run train-name))
+                    (define python-infer (run infer-name))
+
+                    (define (post-process post-param ...) ;; cannot be a method because used with call-with-values
+                      (values out ...))
+
+                    (define/override (train train-param ...)
+                      (when guard-expr
+                        (apply python-train (map racket->python (list lbl ... in ...)))))
+                    
+
+                    (define/override (infer infer-param ...)
+                      (call-with-values (lambda ()
+                                          (output->values (python->racket (apply python-infer (map racket->python (list in ...))))))
+                                        post-process))
+
                     (super-new)))))])))
