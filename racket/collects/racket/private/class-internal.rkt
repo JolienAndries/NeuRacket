@@ -541,6 +541,7 @@
                                           (set-box! input-prev (list #,@in-stx-lst))
                                           (set-box! hold #,this-iid)
                                           #,this-iid)))]
+                                 [(invalidate!) (set-box! input-prev (box #f))]
                                  [else (error "can only access a neural-field")]))))
                         (lambda (msg)
                           (case msg
@@ -553,7 +554,7 @@
                             [(get-input-fields) (lambda ()  (list #,@(map (lambda (in) #`(get-field #,in this)) (syntax->list in-stx-lst))))]
                             [(get-lbl-fields) (lambda ()  (list #,@(map (lambda (lbl) #`(get-field #,lbl this))  (syntax->list lbl-stx-lst))))]
                             [else (dispatch msg hold input-prev)])))))
-               #,@(basic-training-functions lbl-stx-lst in-stx-lst MLo-stx)))
+               #,@(basic-training-functions lbl-stx-lst in-stx-lst MLo-stx this-iid)))
 
     (define ((rewrite-augment-NF iid-stx-lst in-stx-lst lbl-stx-lst MLo-stx) this-iid)
       (let ((replaced-out-iids (map (lambda (id)  (if (free-identifier=? id this-iid)
@@ -578,6 +579,7 @@
                                          (set-box! input-prev inputs)
                                          (set-box! hold #,this-iid)
                                          #,this-iid)))))]
+                       [(invalidate!) (set-box! input-prev (box #f))]
                        [(get-input-fields)  get-input-fields]
                        [(get-lbl-fields) (lambda ()
                                            (append ((old-dispatch 'get-lbl-fields))
@@ -590,7 +592,8 @@
                          (lambda (this-value)
                            (let ((args (append (((access-neural-field!  #,this-iid this) 'get-lbl-fields))
                                                (get-input-fields))))
-                             (send/apply #,MLo-stx train args)))))
+                             (send/apply #,MLo-stx train args)))
+                         (lambda () ((access-neural-field!  #,this-iid this) 'invalidate!))))
                     (syntax->list lbl-stx-lst)))))
 
     (define ((rewrite-override-NF iid-stx-lst in-stx-lst lbl-stx-lst MLo-stx) this-iid)
@@ -610,10 +613,11 @@
                                      (set-box! input-prev (list #,@in-stx-lst))
                                      (set-box! hold #,this-iid)
                                      #,this-iid)))]
+                      [(invalidate!) (set-box! input-prev (box #f))]
                       [(get-input-fields) (lambda () (list #,@(map (lambda (in) #`(get-field #,in this))  (syntax->list in-stx-lst))))]
                       [(get-lbl-fields) (lambda ()  (list #,@(map (lambda (lbl) #`(get-field #,lbl this))  (syntax->list lbl-stx-lst))))]
                       [else (error "override-neural-field: unknown message")])))
-                 #,@(basic-training-functions lbl-stx-lst in-stx-lst MLo-stx))))
+                 #,@(basic-training-functions lbl-stx-lst in-stx-lst MLo-stx this-iid))))
     
     (define (rewrite-neural-field-general specific-rewrite-function idp-lst)
       #`(begin #,@(map (lambda (stx)
@@ -626,7 +630,7 @@
 
     
 
-    (define (basic-training-functions lbls ins MLo)
+    (define (basic-training-functions lbls ins MLo iid)
       (map (lambda (label)
              (define replaced
                (map (lambda (curr-label)
@@ -636,7 +640,8 @@
                     (syntax->list lbls)))
              
              #`((access-neural-field! #,label this) 'set-mlobj! #,MLo
-                                                    (lambda (this-value) (send #,MLo train #,@replaced #,@ins))))
+                                                    (lambda (this-value) (send #,MLo train #,@replaced #,@ins))
+                                                    (lambda () ((access-neural-field!  #,iid this) 'invalidate!))))
            (syntax->list lbls)))
 
     (define (rewrite-abstract-neural-field stx)
@@ -653,6 +658,7 @@
                                     (dispatch (lambda (msg hold input-prev)
                                                 (case msg
                                                   [(get) (lambda () (error "cannot get an abstract neural field"))]
+                                                  [(invalidate!) (set-box! input-prev (box #f))]
                                                   [else (error "abstract neural field: unknown message")]))))
                                 (lambda (msg)
                                   (case msg
@@ -669,7 +675,8 @@
 
                #,@(map (lambda (label)
                          #`(#,label 'set-mlobj! #f ;; no MLo yet
-                                    (lambda (this-value) #f)))
+                                    (lambda (this-value) #f)
+                                    (lambda () #,@(map (lambda (this-iid) #`((access-neural-field!  #,this-iid this) 'invalidate!)) (syntax->list #'(iid ...))))))
                        (syntax->list #'(lbl ...)))))]))
 
 
@@ -1435,7 +1442,7 @@
                                                           (map normalize-init/field (syntax->list #'(idp ...)))])
                                              (syntax-track-origin
                                               (syntax/loc e
-                                                (begin 
+                                                (begin
                                                   (set!
                                                    iid
                                                    (field-initialization-value
@@ -1483,23 +1490,27 @@
                                                   (set! iid (field-initialization-value
                                                              (let ((value expr)
                                                                    (mlobj #f)
-                                                                   (train-function #f))
+                                                                   (train-function #f)
+                                                                   (invalidate-function #f))
                                                                (lambda (msg . args)
                                                                  (case msg
                                                                    [(get) (lambda () value)]
                                                                    [(set!)
                                                                     (lambda (new-value)
                                                                       (set! value new-value)
-                                                                      (when mlobj (train-function value)))]
+                                                                      (when mlobj
+                                                                        (train-function value)
+                                                                        (invalidate-function)))]
                                                                    [(set-no-trigger!)
                                                                     (lambda (new-value)
                                                                       (set! value new-value))]
                                                                    [(set-mlobj!)
-                                                                    (if (= (length args) 2)
+                                                                    (if (= (length args) 3)
                                                                         (begin
                                                                           (set! mlobj (car args))
-                                                                          (set! train-function (cadr args)))
-                                                                        (error "wrong number of arguments for coupling MLObject to label field, needed two, given" args))]
+                                                                          (set! train-function (cadr args))
+                                                                          (set! invalidate-function (caddr args)))
+                                                                        (error "wrong number of arguments for coupling MLObject to label field, needed three, given" args))]
                                                                    [else (error "unknown message for label-field" msg)])))))
                                                   ...))
                                               e
@@ -5365,37 +5376,43 @@ An example
           [label-fields [label-obj label-field] ...]
           [target-fields [target-obj target-field] ...]
           [MLObject MLo])
-       (with-syntax (([label-func ...]
-                      (for/list ([obj (syntax->list #'(label-obj ...))]
-                                 [label (syntax->list #'(label-field ...))])
-                        ;; replace all label fields by a get-field (except for "this" label field) 
-                        (define replaced (map (lambda (curr-obj curr-label)
-                                                (if (and (free-identifier=? curr-obj obj)
-                                                         (free-identifier=? curr-label label))
-                                                    #'this-value
-                                                    #`(get-field #,curr-label #,curr-obj)))
-                                              (syntax->list #'(label-obj ...))
-                                              (syntax->list #'(label-field ...))))
-                        ;; set the train function for each label
-                        #`((access-neural-field! #,label #,obj)
-                           'set-mlobj! MLo (lambda (this-value)
-                                             (send MLo train #,@replaced (get-field input-field input-obj) ...))))))
-         #`(define (slice-name obj-name ...)
-             (((access-neural-field! target-field target-obj) 'fill-in-external!)
-              (lambda (msg hold input-prev)
-                (case msg
-                  [(get)
-                   (lambda ()
-                     (if (equal? (unbox input-prev) (list (get-field input-field input-obj) ...))
-                         (unbox hold)
-                         (let-values ([(target-field ...) (send MLo infer (get-field input-field input-obj) ...)])
-                           (set-box! input-prev (list (get-field input-field input-obj) ...))
-                           (set-box! hold target-field)
-                           target-field)))] 
-                  [else (error "external-neural-field: unknown message")])))
-             ...
+       (with-syntax ((invalidate-func #`(lambda () #,@(map (lambda (fld obj) #`((access-neural-field! #,fld #,obj) 'invalidate!))
+                                                           (syntax->list #'(target-field ...))
+                                                           (syntax->list #'(target-obj ...))))))
+         (with-syntax (([label-func ...] 
+                        (for/list ([obj (syntax->list #'(label-obj ...))]
+                                   [label (syntax->list #'(label-field ...))])
+                          ;; replace all label fields by a get-field (except for "this" label field) 
+                          (define replaced (map (lambda (curr-obj curr-label)
+                                                  (if (and (free-identifier=? curr-obj obj)
+                                                           (free-identifier=? curr-label label))
+                                                      #'this-value
+                                                      #`(get-field #,curr-label #,curr-obj)))
+                                                (syntax->list #'(label-obj ...))
+                                                (syntax->list #'(label-field ...))))
+                          ;; set the train function for each label
+                          #`((access-neural-field! #,label #,obj)
+                             'set-mlobj! MLo
+                             (lambda (this-value)
+                               (send MLo train #,@replaced (get-field input-field input-obj) ...))
+                             invalidate-func))))
+           #`(define (slice-name obj-name ...)
+               (((access-neural-field! target-field target-obj) 'fill-in-external!)
+                (lambda (msg hold input-prev)
+                  (case msg
+                    [(get)
+                     (lambda ()
+                       (if (equal? (unbox input-prev) (list (get-field input-field input-obj) ...))
+                           (unbox hold)
+                           (let-values ([(target-field ...) (send MLo infer (get-field input-field input-obj) ...)])
+                             (set-box! input-prev (list (get-field input-field input-obj) ...))
+                             (set-box! hold target-field)
+                             target-field)))]
+                    [(invalidate!) (set-box! input-prev (box #f))]
+                    [else (error "external-neural-field: unknown message")])))
+               ...
              
-             label-func ...))])))
+               label-func ...)))])))
 
 ;; Providing normal functionality:
 (provide (protect-out get-field/proc)
