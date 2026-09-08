@@ -547,6 +547,7 @@
                                  [(invalidate!) (set-box! input-prev (box #f))]
                                  [(get-input-fields) (lambda () (list #,@(rewrite-get-private in-stx-lst private-field-names-stx-lst)))]
                                  [(get-lbl-fields) (lambda ()  (list #,@(rewrite-get-private lbl-stx-lst private-field-names-stx-lst)))]
+                                 [(get-lbl-field-ids) (lambda () '#,lbl-stx-lst)]
                                  [else (error "can only access a neural-field")]))))
                         (lambda (msg)
                           (case msg
@@ -599,7 +600,7 @@
                          (lambda () ((access-neural-field!  #,this-iid this) 'invalidate!))))
                     (syntax->list lbl-stx-lst)))))
 
-    (define ((rewrite-override-NF iid-stx-lst in-stx-lst lbl-stx-lst MLo-stx private-field-names-stx-lst) this-iid)
+    (define ((rewrite-basic-override-NF iid-stx-lst in-stx-lst lbl-stx-lst MLo-stx private-field-names-stx-lst) this-iid)
       (let ((replaced-out-iids
              (map (lambda (id)
                     (if (free-identifier=? id this-iid)
@@ -619,8 +620,101 @@
                       [(invalidate!) (set-box! input-prev (box #f))]
                       [(get-input-fields) (lambda () (list #,@(rewrite-get-private in-stx-lst private-field-names-stx-lst)))]
                       [(get-lbl-fields) (lambda ()  (list #,@(rewrite-get-private lbl-stx-lst private-field-names-stx-lst)))]
+                      [(get-lbl-field-ids) (lambda () '#,lbl-stx-lst)] 
                       [else (error "override-neural-field: unknown message")])))
                  #,@(basic-training-functions lbl-stx-lst in-stx-lst MLo-stx this-iid))))
+
+    (define ((rewrite-super-override-NF iid-stx-lst super-in in-stx-lst1 in-stx-lst2 super-lbl lbl-stx-lst1 lbl-stx-lst2 MLo-stx private-field-names-stx-lst) this-iid)
+      ;; when super-.. is false, the ..-stx-lst2 is empty
+      (let ((replaced-out-iids (map (lambda (id)  (if (free-identifier=? id this-iid)
+                                                      #'(unbox hold)
+                                                      (datum->syntax id `(get-field ,(syntax-e id) this))))
+                                    (syntax->list iid-stx-lst))))
+        #`(let* ((old-dispatch #f)
+                 (get-input-fields  #,(if super-in
+                                          #`(lambda ()
+                                              (append (list #,@(rewrite-get-private in-stx-lst1 private-field-names-stx-lst))
+                                                      ((old-dispatch 'get-input-fields))
+                                                      (list #,@(rewrite-get-private in-stx-lst2 private-field-names-stx-lst))))
+                                          #`(lambda () (list #,@(rewrite-get-private in-stx-lst1 private-field-names-stx-lst))))))
+            (set! old-dispatch
+                  (((access-neural-field!  #,this-iid this) 'update-dispatch!)
+                   (lambda (msg [hold #f] [input-prev #f])
+                     (case msg
+                       [(get)
+                        (lambda ()
+                          (let ((inputs (get-input-fields)))
+                            (if (equal? (unbox input-prev) inputs)
+                                (unbox hold)
+                                (begin (let-values ([#,iid-stx-lst (send/apply #,MLo-stx infer inputs)])
+                                         (set-box! input-prev inputs)
+                                         (set-box! hold #,this-iid)
+                                         #,this-iid)))))]
+                       [(invalidate!) (set-box! input-prev (box #f))]
+                       [(get-input-fields)  get-input-fields]
+                       [(get-lbl-fields) (lambda () #,(if super-lbl
+                                                          #`(append (list #,@(map (lambda (lbl) #`(get-field #,lbl this))  (syntax->list lbl-stx-lst1)))
+                                                                    ((old-dispatch 'get-lbl-fields))
+                                                                    (list #,@(map (lambda (lbl) #`(get-field #,lbl this))  (syntax->list lbl-stx-lst2))))
+                                                          #`(list #,@(map (lambda (lbl) #`(get-field #,lbl this))  (syntax->list lbl-stx-lst1)))))]
+                       [(get-lbl-field-ids) (lambda ()  #,(if super-lbl
+                                                              #`(append '#,lbl-stx-lst1 ((old-dispatch 'get-lbl-field-ids)) '#,lbl-stx-lst2)
+                                                              lbl-stx-lst1))]
+                       [else (error "override-neural-field: unknown message")]))))
+            #,@(map (lambda (label)
+                      #`((access-neural-field! #,label this)
+                         'set-mlobj! #,MLo-stx
+                         (lambda (this-value)
+                           (let ((args (append (((access-neural-field!  #,this-iid this) 'get-lbl-fields))
+                                               (get-input-fields))))
+                             (send/apply #,MLo-stx train args)))
+                         (lambda () ((access-neural-field!  #,this-iid this) 'invalidate!))))
+                    (if super-lbl
+                        (append (syntax->list lbl-stx-lst1) (syntax->list lbl-stx-lst2))
+                        (syntax->list lbl-stx-lst1)))
+            #,(when super-lbl
+                #`(for-each (lambda (label)
+                              ((dynamic-access-neural-field label this)
+                               'set-mlobj! #,MLo-stx
+                               (lambda (this-value)
+                                 (let ((args (append (((access-neural-field!  #,this-iid this) 'get-lbl-fields))
+                                                     (get-input-fields))))
+                                   (send/apply #,MLo-stx train args)))
+                               (lambda () ((access-neural-field!  #,this-iid this) 'invalidate!))))
+                            ((old-dispatch 'get-lbl-field-ids)))))))
+
+    
+
+    (define (split-at-super stx-lst)
+      (define (iter lst1 lst2)
+        (cond ((null? lst1) #f)
+              ((free-identifier=? (car lst1) #'super)
+               (cons (reverse lst2) (cdr lst1))) ;; the first part was in lst2, after the super is in lst1
+              (else (iter (cdr lst1) (cons (car lst1) lst2)))))
+      (iter (syntax->list stx-lst) '()))
+
+    (define (rewrite-override-NF-dispatcher idp-lst private-field-names-stx-lst)
+      #`(begin #,@(map (lambda (stx)
+                         (syntax-case stx (super)
+                           [((out ...) MLo (in ...) (lbl ...))
+                            (with-syntax ([[((iid eid)) ...] (map normalize-init/field (syntax->list #'(out ...)))])
+                              (let ((ins (split-at-super #'(in ...)))
+                                    (lbls (split-at-super #'(lbl ...))))
+                                (let ((rewrite-function (cond ((and ins lbls)
+                                                               (rewrite-super-override-NF #'(iid ...) #t #`(#,@(car ins)) #`(#,@(cdr ins))
+                                                                                          #t #`(#,@(car lbls)) #`(#,@(cdr lbls))
+                                                                                          #'MLo  private-field-names-stx-lst))
+                                                              (ins  (rewrite-super-override-NF #'(iid ...) #t #`(#,@(car ins)) #`(#,@(cdr ins))
+                                                                                               #f #'(lbl ...) '()
+                                                                                               #'MLo  private-field-names-stx-lst))
+                                                              (lbls (rewrite-super-override-NF #'(iid ...) #f #'(in ...) '()
+                                                                                               #t #`(#,@(car lbls)) #`(#,@(cdr lbls))
+                                                                                               #'MLo  private-field-names-stx-lst))
+                                                              (else (rewrite-basic-override-NF #'(iid ...) #'(in ...) #'(lbl ...)
+                                                                                               #'MLo  private-field-names-stx-lst)))))
+                                  #`(begin #,@(map rewrite-function (syntax->list #'(iid ...)))))))]))
+                       (syntax->list idp-lst))))
+      
     
     (define (rewrite-neural-field-general specific-rewrite-function idp-lst private-field-names-stx-lst)
       #`(begin #,@(map (lambda (stx)
@@ -658,10 +752,13 @@
                              (field-initialization-value
                               (let ((hold (box #f))
                                     (input-prev (box #f))
-                                    (dispatch (lambda (msg hold input-prev)
+                                    (dispatch (lambda (msg [hold #f] [input-prev #f])
                                                 (case msg
                                                   [(get) (lambda () (error "cannot get an abstract neural field"))]
                                                   [(invalidate!) (set-box! input-prev (box #f))]
+                                                  [(get-input-fields) (lambda () (list #,@(rewrite-get-private #'(in ...) private-field-names-stx-lst)))]
+                                                  [(get-lbl-fields) (lambda ()  (list #,@(rewrite-get-private #'(lbl ...) private-field-names-stx-lst)))]
+                                                  [(get-lbl-field-ids) (lambda () '(lbl ...))]
                                                   [else (error "abstract neural field: unknown message")]))))
                                 (lambda (msg)
                                   (case msg
@@ -671,8 +768,6 @@
                                          (set-box! input-prev #f)
                                          (set! dispatch new-dispatch)
                                          old-dispatch))]
-                                    [(get-input-fields) (lambda () (list #,@(rewrite-get-private #'(in ...) private-field-names-stx-lst)))]
-                                    [(get-lbl-fields) (lambda ()  (list #,@(rewrite-get-private #'(lbl ...) private-field-names-stx-lst)))]
                                     [else (dispatch msg hold input-prev)]))))))
                    (syntax->list #'(iid ...)))
 
@@ -1438,7 +1533,8 @@
                                           [(-fld orig idp ...) 
                                            (and (identifier? #'-fld)
                                                 (free-identifier=? #'-fld #'-override-neural-field))
-                                           (rewrite-neural-field-general rewrite-override-NF #'(idp ...) private-field-names)]
+                                           ; todo rem (rewrite-neural-field-general rewrite-basic-override-NF #'(idp ...) private-field-names)
+                                           (rewrite-override-NF-dispatcher #'(idp ...) private-field-names)]
                                           [(-fld orig idp ...)
                                            (and (identifier? #'-fld)
                                                 (free-identifier=? #'-fld #'-external-neural-field))
@@ -4082,7 +4178,6 @@ An example
   ;; Generate correct class by concretizing methods w/interface ctcs
   (define concrete-class (fetch-concrete-class class blame))
   (define o ((class-make-object concrete-class)))
-  
   (unless (eq? by-pos-args 'uninit)
     (continue-make-object o concrete-class by-pos-args named-args #t
                           wrapped-blame wrapped-neg-party init-proj-pairs))
@@ -4831,13 +4926,16 @@ An example
   (unless (symbol? id) (raise-argument-error 'dynamic-get-field "symbol?" id))
   (do-get-field 'dynamic-get-field id obj))
 
+(define (dynamic-access-neural-field id obj)
+  (do-access-neural-field! 'dynamic-access-neural-field id obj))
+
 (define-syntax (access-neural-field! stx)
   (syntax-case stx ()
     [(_ name obj)
      (identifier? #'name)
      (with-syntax ([localized (localize #'name)])
        (class-syntax-protect
-        (syntax/loc stx (do-access-neural-field! 'access-neural-field! `localized obj))))] ;; I did not do the /proc intermediate procedure because I do not have a dynamic-access-neural-field!
+        (syntax/loc stx (do-access-neural-field! 'access-neural-field! `localized obj))))] 
     [(_ name obj val)
      (raise-syntax-error
       'add-field-watcher! "expected a field name as first argument"
