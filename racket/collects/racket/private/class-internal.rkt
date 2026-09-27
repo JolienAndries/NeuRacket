@@ -5447,33 +5447,34 @@ An example
                           #`((access-neural-field! #,label #,obj)
                              'set-mlobj! MLo
                              (lambda (this-value)
-                               (send MLo train #,@replaced . input-field-lst))
+                               (send/apply MLo train #,@replaced (get-input-field-lst)))
                              invalidate-func))))
            #`(define (slice-name obj-name ...)
-               (let ((input-field-lst (map (lambda (obj fld)
-                                             (define cls (object-ref/unwrap obj))
-                                             (if (member fld (class-field-ids cls))
-                                                 ;; it is a public field
-                                                 (dynamic-get-field fld obj)
-                                                 ;; private / not part of the object
-                                                 ;; to get the access field ref idx, I need to figure out
-                                                 ;; 1. how many non-inherited public fields there are in this class and
-                                                 ;; 2. which index the private field has
-                                                 (let ((all-super-classes (class-supers cls)))
-                                                   (get-private-field obj fld cls all-super-classes (- (vector-length all-super-classes) 2)))));; length - 1 = class itself, length -2 = lowest super
-                                           (list input-obj ...)
-                                           '(input-field ...))))
+               (let ((get-input-field-lst (lambda () (map (lambda (obj fld)
+                                                            (define cls (object-ref/unwrap obj))
+                                                            (if (member fld (class-field-ids cls))
+                                                                ;; it is a public field
+                                                                (dynamic-get-field fld obj)
+                                                                ;; private / not part of the object
+                                                                ;; to get the access field ref idx, I need to figure out
+                                                                ;; 1. how many non-inherited public fields there are in this class and
+                                                                ;; 2. which index the private field has
+                                                                (let ((all-super-classes (class-supers cls)))
+                                                                  (get-private-field obj fld cls all-super-classes (- (vector-length all-super-classes) 2)))));; length - 1 = class itself, length -2 = lowest super
+                                                          (list input-obj ...)
+                                                          '(input-field ...)))))
                  (((access-neural-field! target-field target-obj) 'fill-in-external!)
                   (lambda (msg hold input-prev)
                     (case msg
                       [(get)
                        (lambda ()
-                         (if (equal? (unbox input-prev) input-field-lst)
-                             (unbox hold)
-                             (let-values ([(target-field ...) (send MLo infer . input-field-lst)])
-                               (set-box! input-prev input-field-lst)
-                               (set-box! hold target-field)
-                               target-field)))]
+                         (let ((input-field-lst (get-input-field-lst)))
+                           (if (equal? (unbox input-prev) input-field-lst)
+                               (unbox hold)
+                               (let-values ([(target-field ...) (send MLo infer . input-field-lst)])
+                                 (set-box! input-prev input-field-lst)
+                                 (set-box! hold target-field)
+                                 target-field))))]
                       [(invalidate!) (set-box! input-prev (box #f))]
                       [else (error "external-neural-field: unknown message")])))
                  ...
