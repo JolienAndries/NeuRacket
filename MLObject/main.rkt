@@ -1,6 +1,6 @@
 #lang racket/base
 
-(require (for-syntax racket/base (only-in racket/list flatten remove-duplicates)) (only-in racket/vector vector-map) 
+(require (for-syntax racket/base (only-in racket/list flatten remove-duplicates) (only-in racket/syntax format-id)) (only-in racket/vector vector-map) 
          racket/class (only-in racket/function identity))
 (provide defMLObject identity)
 
@@ -38,12 +38,48 @@
 
 (define-for-syntax (get-param lst-stx)
   (remove-duplicates (flatten (map (lambda (stx)
-                                     (let ((param (syntax->datum stx)))
-                                       (if (list? param)
-                                           (map (lambda (el) (datum->syntax stx el)) (cdr param)) ;; stx is the context
-                                           stx)))
+                                     (syntax-case stx ()
+                                       [id
+                                        (identifier? #'id)
+                                        #'id]
+                                       [(proc arg ...)
+                                        (syntax->list #'(arg ...))]))
                                    (syntax->list lst-stx)))
                      free-identifier=?))
+
+(define-for-syntax (prefix-ids prefix lst-stx)
+  (map (lambda (stx)
+         (syntax-case stx ()
+           [id
+            (identifier? #'id)
+            (format-id #'id "~a~a" prefix #'id)]
+           [(proc arg ...)
+            (cons #'proc (map (lambda (id)
+                                (format-id id "~a~a" prefix id))
+                              (syntax->list #'(arg ...))))]))
+       (syntax->list lst-stx)))
+
+
+(define-for-syntax (prefix-guard expr to-prefix-ids-stx)
+  (define guard-prefix "in-")
+  (define to-prefix-ids (get-param to-prefix-ids-stx))
+  (define (prefix? id)
+    (ormap (lambda (to-prefix)
+             (free-identifier=? id to-prefix))
+           to-prefix-ids))
+  (define (transform expr)
+    (syntax-case expr ()
+      [id
+       (and (identifier? #'id) (prefix? #'id))
+       (format-id #'id "~a~a" guard-prefix #'id)]
+      [(id ...)
+       (with-syntax ([(new-id ...)
+                      (map transform (syntax->list #'(id ...)))])
+         #'(new-id ...))]
+      [expr #'expr]))
+
+  (transform expr))
+    
 
 
 (define-syntax defMLObject
@@ -53,111 +89,117 @@
           [file file-name]
           [infer infer-name]
           [train train-name]
-          [input in ...]
-          [label lbl ...])
-  
-       (with-syntax ([(infer-param ...) (get-param #'(in ...))]
-                     [(train-param ...) (get-param #'(lbl ... in ...))])
-         #`(define obj-name
-             (new (class MLclass%
+          [input non-prefixed-in ...]
+          [label non-prefixed-lbl ...])
+       (with-syntax ([(in ...) (prefix-ids "in-" #'(non-prefixed-in ...))]
+                     [(lbl ...) (prefix-ids "lbl-" #'(non-prefixed-lbl ...))])
+         (with-syntax ([(infer-param ...) (get-param #'(in ...))]
+                       [(train-param ...) (get-param #'(lbl ... in ...))])
+           #`(define obj-name
+               (new (class MLclass%
 
-                    (run* (string-append "with open('" file-name "') as file: exec(file.read())"))
-                    (define python-train (run train-name))
-                    (define python-infer (run infer-name))
+                      (run* (string-append "with open('" file-name "') as file: exec(file.read())"))
+                      (define python-train (run train-name))
+                      (define python-infer (run infer-name))
 
-                    (define/override (train train-param ...)
-                      (apply python-train (map racket->python (list lbl ... in ...))))
+                      (define/override (train train-param ...)
+                        (apply python-train (map racket->python (list lbl ... in ...))))
                     
 
-                    (define/override (infer infer-param ...)
-                      (output->values (python->racket (apply python-infer (map racket->python (list in ...))))))
-                    (super-new)))))]
+                      (define/override (infer infer-param ...)
+                        (output->values (python->racket (apply python-infer (map racket->python (list in ...))))))
+                      (super-new))))))]
       [(_ obj-name
           [file file-name]
           [infer infer-name]
           [train train-name]
-          [input in ...]
-          [label lbl ...]
+          [input non-prefixed-in ...]
+          [label non-prefixed-lbl ...]
           [output out ...])
-  
-       (with-syntax ([(infer-param ...) (get-param #'(in ...))]
-                     [(train-param ...) (get-param #'(lbl ... in ...))]
-                     [(post-param ...) (get-param #'(out ...))])
-         #`(define obj-name
-             (new (class MLclass%
+       (with-syntax ([(in ...) (prefix-ids "in-" #'(non-prefixed-in ...))]
+                     [(lbl ...) (prefix-ids "lbl-" #'(non-prefixed-lbl ...))])
+         (with-syntax ([(infer-param ...) (get-param #'(in ...))]
+                       [(train-param ...) (get-param #'(lbl ... in ...))]
+                       [(post-param ...) (get-param #'(out ...))])
+           #`(define obj-name
+               (new (class MLclass%
 
-                    (run* (string-append "with open('" file-name "') as file: exec(file.read())"))
-                    (define python-train (run train-name))
-                    (define python-infer (run infer-name))
+                      (run* (string-append "with open('" file-name "') as file: exec(file.read())"))
+                      (define python-train (run train-name))
+                      (define python-infer (run infer-name))
 
-                    (define (post-process post-param ...) ;; cannot be a method because used with call-with-values
-                      (values out ...))
+                      (define (post-process post-param ...) ;; cannot be a method because used with call-with-values
+                        (values out ...))
 
-                    (define/override (train train-param ...)
-                      (apply python-train (map racket->python (list lbl ... in ...))))
+                      (define/override (train train-param ...)
+                        (apply python-train (map racket->python (list lbl ... in ...))))
                     
 
-                    (define/override (infer infer-param ...)
-                      (call-with-values (lambda ()
-                                          (output->values (python->racket (apply python-infer (map racket->python (list in ...))))))
-                                        post-process))
+                      (define/override (infer infer-param ...)
+                        (call-with-values (lambda ()
+                                            (output->values (python->racket (apply python-infer (map racket->python (list in ...))))))
+                                          post-process))
 
-                    (super-new)))))]
+                      (super-new))))))]
       [(_ obj-name
           [file file-name]
           [infer infer-name]
           [train train-name]
-          [input in ...]
-          [label lbl ...]
-          [guard guard-expr])
-  
-       (with-syntax ([(infer-param ...) (get-param #'(in ...))]
-                     [(train-param ...) (get-param #'(lbl ... in ...))])
-         #`(define obj-name
-             (new (class MLclass%
+          [input non-prefixed-in ...]
+          [label non-prefixed-lbl ...]
+          [guard non-prefixed-guard-expr])
+       (with-syntax ([(in ...) (prefix-ids "in-" #'(non-prefixed-in ...))]
+                     [(lbl ...) (prefix-ids "lbl-" #'(non-prefixed-lbl ...))]
+                     [guard-expr (prefix-guard #'non-prefixed-guard-expr #'(non-prefixed-in ...))])
+     
+         (with-syntax ([(infer-param ...) (get-param #'(in ...))]
+                       [(train-param ...) (get-param #'(lbl ... in ...))])
+           #`(define obj-name
+               (new (class MLclass%
 
-                    (run* (string-append "with open('" file-name "') as file: exec(file.read())"))
-                    (define python-train (run train-name))
-                    (define python-infer (run infer-name))
+                      (run* (string-append "with open('" file-name "') as file: exec(file.read())"))
+                      (define python-train (run train-name))
+                      (define python-infer (run infer-name))
 
-                    (define/override (train train-param ...)
-                      (when guard-expr
-                        (apply python-train (map racket->python (list lbl ... in ...)))))
+                      (define/override (train train-param ...)
+                        (when guard-expr
+                          (apply python-train (map racket->python (list lbl ... in ...)))))
                     
 
-                    (define/override (infer infer-param ...)
-                      (output->values (python->racket (apply python-infer (map racket->python (list in ...))))))
-                    (super-new)))))]
+                      (define/override (infer infer-param ...)
+                        (output->values (python->racket (apply python-infer (map racket->python (list in ...))))))
+                      (super-new))))))]
       [(_ obj-name
           [file file-name]
           [infer infer-name]
           [train train-name]
-          [input in ...]
-          [label lbl ...]
-          [guard guard-expr]
+          [input non-prefixed-in ...]
+          [label non-prefixed-lbl ...]
+          [guard non-prefixed-guard-expr]
           [output out ...])
-  
-       (with-syntax ([(infer-param ...) (get-param #'(in ...))]
-                     [(train-param ...) (get-param #'(lbl ... in ...))]
-                     [(post-param ...) (get-param #'(out ...))])
-         #`(define obj-name
-             (new (class MLclass%
+       (with-syntax ([(in ...) (prefix-ids "in-" #'(non-prefixed-in ...))]
+                     [(lbl ...) (prefix-ids "lbl-" #'(non-prefixed-lbl ...))])
+         (with-syntax ([(infer-param ...) (get-param #'(in ...))]
+                       [(train-param ...) (get-param #'(lbl ... in ...))]
+                       [(post-param ...) (get-param #'(out ...))]
+                       [guard-expr (prefix-guard #'non-prefixed-guard-expr #'(non-prefixed-in ...))])
+           #`(define obj-name
+               (new (class MLclass%
 
-                    (run* (string-append "with open('" file-name "') as file: exec(file.read())"))
-                    (define python-train (run train-name))
-                    (define python-infer (run infer-name))
+                      (run* (string-append "with open('" file-name "') as file: exec(file.read())"))
+                      (define python-train (run train-name))
+                      (define python-infer (run infer-name))
 
-                    (define (post-process post-param ...) ;; cannot be a method because used with call-with-values
-                      (values out ...))
+                      (define (post-process post-param ...) ;; cannot be a method because used with call-with-values
+                        (values out ...))
 
-                    (define/override (train train-param ...)
-                      (when guard-expr
-                        (apply python-train (map racket->python (list lbl ... in ...)))))
-                    
+                      (define/override (train train-param ...)
+                        (when guard-expr
+                          (apply python-train (map racket->python (list lbl ... in ...)))))
 
-                    (define/override (infer infer-param ...)
-                      (call-with-values (lambda ()
-                                          (output->values (python->racket (apply python-infer (map racket->python (list in ...))))))
-                                        post-process))
+                      (define/override (infer infer-param ...)
+                        (call-with-values (lambda ()
+                                            (output->values (python->racket (apply python-infer (map racket->python (list in ...))))))
+                                          post-process))
 
-                    (super-new)))))])))
+                      (super-new))))))])))
