@@ -1,54 +1,14 @@
-[Racket](https://racket-lang.org/) is a general-purpose programming
-language and an ecosystem for language-oriented programming.
 
-This repository holds the source code for the core of Racket plus some
-related packages. The rest of the Racket distribution source code is
-in other repositories, mostly under [the Racket GitHub
-organization](https://github.com/racket).
+# NeuRacket
 
-Quick Start
------------
+This is a fork of the [Racket](https://racket-lang.org/) language. 
+It adds `defMLObject`, `defneuralslice`, `neural-field`, `abstract-neural-field`, `override-neural-field`, `external-neural-field`, and `label-field` to the Racket Class System. 
 
-Pre-built versions of Racket for a variety of operating systems and
-architectures, as well as convenient source distributions are
-available at
+# How to use it
 
-  [https://download.racket-lang.org](https://download.racket-lang.org)
+To use NeuRacket:
+1. clone this repository
+2. in `NeuRacket/` run `make`
+3. in `NeuRacket/MLObject` run `...path-to-NeuRacket.../NeuRacket/racket/bin/raco pkg install`
 
-Racket comes with extensive documentation, including several tutorials.
-You can read all of this documentation, as well as documentation for
-third-party packages at
-
-  [https://docs.racket-lang.org](https://docs.racket-lang.org)
-
-Building from Source
---------------------
-
-For information on building Racket from this repository, see the
-[Build Guide](build.md).
-
-Contributing
-------------
-
-Contribute to Racket by
-* [submitting a pull request](https://github.com/racket/racket)
-* visiting the Racket forums 
-  * [Racket Discussions Discourse](https://racket.discourse.group/)
-  * [Racket Discord](https://discord.gg/6Zq8sH5) #internals
-
-By making a contribution, you are agreeing that your contribution is
-licensed under the LGPLv3, Apache 2.0, and MIT licenses. Those
-licenses are available in this repository in the files
-racket/src/LICENSE-LGPL.txt, racket/src/LICENSE-APACHE.txt, and
-racket/src/LICENSE-MIT.txt.
-
-See the [Building, Distributing, and Contributing to Racket](build.md) 
-for more guidance on contributing.
-
-The [Friendly Environment Policy](https://racket-lang.org/friendly.html) 
-contains guidelines on expected behavior within the Racket community.
-
-License
--------
-
-Racket is free software; see [LICENSE](LICENSE.txt) for more details.
+Then `...path-to-NeuRacket.../NeuRacket/racket/bin/racket` can be used in the same way as the `racket` command from the [Racket](https://racket-lang.org/) language. 
