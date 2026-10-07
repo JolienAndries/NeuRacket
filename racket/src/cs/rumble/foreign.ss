@@ -13,11 +13,14 @@
 ;; can be updated atomically in the case of `ptr-set!`. A `_gcpointer`
 ;; corresponds to a cpointer where the fptr answers #t for
 ;; `ftype-scheme-object-pointer?`.
-(define-record-type (cpointer make-cpointer authentic-cpointer?)
-  (fields (mutable fptr) (mutable tags)))
-(define-record-type cpointer+offset
-  (parent cpointer)
-  (fields base-fptr))
+(define-racket-record-type cpointer
+  [fields (mutable fptr) (mutable tags)]
+  [nongenerative]
+  [sealed #f]
+  [constructor make-cpointer]
+  [predicate authentic-cpointer?])
+(define-racket-record-type cpointer+offset cpointer
+  [fields (immutable base-fptr)])
 
 (define-values (prop:cpointer has-cpointer-property? cpointer-property-ref)
   (make-struct-type-property 'cpointer
@@ -101,7 +104,7 @@
 
 (define/who (set-cpointer-tag! p t)
   (if (authentic-cpointer? p)
-      (cpointer-tags-set! p t)
+      (set-cpointer-tags! p t)
       (if (cpointer? p)
           (let ([q (extract-authentic-cpointer p)])
             (if q
@@ -162,7 +165,7 @@
     (raise-argument-error who "(and/c cpointer? ptr-offset?)" p))
   (unless (exact-integer? n)
     (raise-argument-error who "exact-integer?" n))
-  (cpointer-fptr-set! p (let ([m (cpointer+offset-base-fptr p)])
+  (set-cpointer-fptr! p (let ([m (cpointer+offset-base-fptr p)])
                           (cond
                             [(ftype-scheme-object-pointer? m)
                              (make-ftype-scheme-object-pointer (ftype-scheme-object-pointer-object m)
@@ -227,13 +230,13 @@
       (raise-argument-error 'ptr-add! "exact-integer?" n))
     (unless (ctype? type)
       (raise-argument-error 'ptr-add! "ctype?" type))
-    (cpointer-fptr-set! p (fptr-add (cpointer-fptr p) (* n (ctype-sizeof type))))]
+    (set-cpointer-fptr! p (fptr-add (cpointer-fptr p) (* n (ctype-sizeof type))))]
    [(p n)
     (unless (cpointer+offset? p)
       (raise-argument-error 'ptr-add! "(and/c cpointer? offset-ptr?)" p))
     (unless (exact-integer? n)
       (raise-argument-error 'ptr-add! "exact-integer?" n))
-    (cpointer-fptr-set! p (fptr-add (cpointer-fptr p) n))]))
+    (set-cpointer-fptr! p (fptr-add (cpointer-fptr p) n))]))
 
 ;; ----------------------------------------
 
@@ -392,13 +395,15 @@
                    (ftype-any-ref ftype-scheme-object-pointer () (cptr->fptr who c) offset)))
                 (lambda (for-whom dest-c offset s)
                   (let ([m (cptr->fptr for-whom dest-c)])
-                    (if (and (ftype-scheme-object-pointer? m)
+                    (if (and s
+                             (ftype-scheme-object-pointer? m)
                              (reference-bytevector? (ftype-scheme-object-pointer-object m)))
-                        ;; use `bytevector-reference-set!` to get write barrier
+                        ;; use `bytevector-reference-set!` to get write barrier; it's
+                        ;; important that `s` is not `#f`, since that turns into NULL
                         (let ([offset (+ offset (ftype-scheme-object-pointer-offset m))])
                           (bytevector-reference-set! (ftype-scheme-object-pointer-object m) offset s))
                         ;; only sensible if `s` is immobile
-                        (ftype-any-set! ftype-scheme-object-pointer () (cptr->fptr for-whom dest-c) offset
+                        (ftype-any-set! ftype-scheme-object-pointer () m offset
                                         (make-ftype-scheme-object-pointer s)))))))
 
 (define (bad-ctype-value who type-name v)
@@ -872,9 +877,13 @@
   (check who ffi-lib? lib)
   (ffi-unload-lib (ffi-lib-handle lib))) 
 
-(define-record-type (cpointer/ffi-obj make-ffi-obj ffi-obj?)
-  (parent cpointer)
-  (fields lib name))
+(define-racket-record-type cpointer/ffi-obj cpointer
+  [fields (immutable lib)
+          (immutable name)]
+  [nongenerative]
+  [sealed #t]
+  [constructor make-ffi-obj]
+  [predicate ffi-obj?])
 
 (define (ffi-obj* who name lib wrap)
   (check who bytes? name)
@@ -921,7 +930,10 @@
     (raise
      (|#%app|
       exn:fail:filesystem
-      (format "~a: not yet ready\n  name: ~a" who name)
+      (error-message->adjusted-string
+       who primitive-realm
+       (format "not yet ready\n  name: ~a" name)
+       primitive-realm)
       (current-continuation-marks)))))
 
 (define ffi-ptr->address
@@ -1321,15 +1333,17 @@
   (when (ftype-scheme-object-pointer? p)
     (unlock-object (ftype-scheme-object-pointer-object p))))
 
-(define-record-type (cpointer/cell make-cpointer/cell cpointer/cell?)
-  (parent cpointer)
-  (fields))
+(define-racket-record-type cpointer/cell cpointer
+  [fields])
 
 (define immobile-cells (make-eq-hashtable))
 
 (define (malloc-immobile-cell v)
   (let ([vec (make-immobile-reference-bytevector (foreign-sizeof 'ptr))])
-    (bytevector-reference-set! vec 0 v)
+    (if v
+        (bytevector-reference-set! vec 0 v) ; note: would map `v` as `#f` to NULL
+        (ftype-any-set! ftype-scheme-object-pointer () (make-ftype-scheme-object-pointer vec) 0
+                        (make-ftype-scheme-object-pointer #f)))
     (with-global-lock
      (eq-hashtable-set! immobile-cells vec #t))
     (fptr->cptr (make-ftype-scheme-object-pointer vec))))
@@ -1967,9 +1981,12 @@
 
 ;; ----------------------------------------
 
-(define-record-type (callback create-callback ffi-callback?)
-  (parent cpointer)
-  (fields code))
+(define-racket-record-type callback cpointer
+  [fields (immutable code)]
+  [nongenerative]
+  [sealed #t]
+  [constructor create-callback]
+  [predicate ffi-callback?])
 
 (define/who ffi-callback
   (case-lambda
@@ -2489,9 +2506,9 @@
 
 (define (init-errno!)
   (case (machine-type)
-    [(a6nt ta6nt i3nt ti3nt)
+    [(i3nt ti3nt)
      (current-errno-source 'msvcrt)]
-    [(arm64nt tarm64nt)
+    [(arm64nt tarm64nt a6nt ta6nt)
      (current-errno-source 'ucrt)]
     [else
      (void)]))
@@ -2517,7 +2534,7 @@
 ;; ----------------------------------------
 
 (define (set-cpointer-hash!)
-  (struct-set-equal+hash! (record-type-descriptor cpointer)
+  (struct-set-equal+hash! rtd:cpointer
                           (lambda (a b eql?)
                             (ptr-equal? a b))
                           (lambda (a hc)
@@ -2526,8 +2543,8 @@
                                   (+ (eq-hash-code (ftype-scheme-object-pointer-object m))
                                      (ftype-scheme-object-pointer-offset m))
                                   (ftype-pointer-address m)))))
-  (inherit-equal+hash! (record-type-descriptor cpointer+offset)
-                       (record-type-descriptor cpointer)))
+  (inherit-equal+hash! rtd:cpointer+offset
+                       rtd:cpointer))
 
 ;; ----------------------------------------
 

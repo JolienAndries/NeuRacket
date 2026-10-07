@@ -20,8 +20,14 @@
   (check-true (ffi2-is-a? p void_t*))
   (check-true (ffi2-is-a? p (gcable_t void_t*))) ; does not check gcableness
   (check-true (ffi2-is-a? p void_t*/gcable)) ; does not check gcableness
+  (check-true (ptr_t? p))
+  (check-false (ptr_t/gcable? p))
   (check-false (ffi2-is-a? p ours_t*))
   (check-false (ffi2-is-a? p mine_t*))
+  (check-true (ptr_t? (ptr_t/gcable->ptr_t p)))
+  (check-false (ptr_t/gcable? (ptr_t/gcable->ptr_t p)))
+  (check-true (ptr_t? (ptr_t->ptr_t/gcable p)))
+  (check-true (ptr_t/gcable? (ptr_t->ptr_t/gcable p)))
   (ffi2-free p))
 
 (let ()
@@ -108,4 +114,15 @@
   (check-true (int_t*? p))
   (ffi2-free p)
   (check-true (ffi2-is-a? (ffi2-malloc int_t*) (array_t (gcable_t (array_t int_t *)) *)))
+  (void))
+
+(let ()
+  (define-ffi2-type int_t* (array_t int_t *))
+  (check-true (ffi2-is-a? (ffi2-new int_t 1 2 3) (array_t int_t *)))
+  (check-true (ffi2-is-a? (ffi2-new int_t 1 3) (gcable_t (array_t int_t *))))
+  (define p (ffi2-new #:manual int_t 4 5 6))
+  (check-true (ffi2-is-a? p (gcable_t (array_t int_t *))))
+  (check-true (int_t*? p))
+  (ffi2-free p)
+  (check-true (ffi2-is-a? (ffi2-new int_t* (ffi2-malloc int_t)) (array_t (gcable_t (array_t int_t *)) *)))
   (void))

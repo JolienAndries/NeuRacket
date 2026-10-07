@@ -18,6 +18,9 @@
 #ifdef USE_ITIMER
 # include <sys/time.h>
 #endif
+#ifndef MZ_PRECISE_GC
+# include "schgc.h"
+#endif
 
 #define mzAssert(x) /* if (!(x)) abort() */
 
@@ -966,6 +969,25 @@ static void post_progress(Scheme_Input_Port *ip)
 {
   scheme_post_sema_all(ip->progress_evt);
   ip->progress_evt = NULL;
+
+  if (ip->unless) {
+    /* Bytes were consumed, so any thread that is blocked in a read
+       or peek needs to start over */
+    SCHEME_CAR(ip->unless) = scheme_true;
+    ip->unless = NULL;
+
+    /* A blocked thread may be waiting on a semaphore for a file
+       descriptor, instead of polling its "unless" */
+    if (!ip->closed) {
+      rktio_fd_t *fd;
+      if (SAME_OBJ(ip->sub_type, fd_input_port_type))
+        fd = ((Scheme_FD *)ip->port_data)->fd;
+      else
+        fd = scheme_get_port_rktio_socket((Scheme_Object *)ip);
+      if (fd)
+        scheme_wake_fd_readers(fd);
+    }
+  }
 }
 
 XFORM_NONGCING static void inc_pos_for_special(Scheme_Port *ip)
@@ -1109,9 +1131,10 @@ intptr_t scheme_get_byte_string_unless(const char *who,
 {
   Scheme_Input_Port *ip;
   intptr_t got = 0, total_got = 0, gc;
-  int special_ok = special_is_ok, check_special;
+  int special_ok = special_is_ok, check_special, recheck_peeked = 0, depipe_short;
   Scheme_Get_String_Fun gs;
   Scheme_Peek_String_Fun ps;
+  Scheme_Object *orig_peek_skip;
 
   /* See also get_one_byte, below. Any change to this function
      may require a change to 1-byte specialization of get_one_byte. */
@@ -1131,6 +1154,7 @@ intptr_t scheme_get_byte_string_unless(const char *who,
   }
   if (!peek_skip)
     peek_skip = scheme_make_integer(0);
+  orig_peek_skip = peek_skip;
 
   ip = scheme_input_port_record(port);
 
@@ -1140,15 +1164,20 @@ intptr_t scheme_get_byte_string_unless(const char *who,
   while (1) {
     SCHEME_USE_FUEL(1);
 
+    depipe_short = 0;
+
     if (ip->input_lock)
       scheme_wait_input_allowed(ip, only_avail);
 
-    /* check progress evt before checking for closed: */
-    if (unless_evt 
-        && SAME_TYPE(SCHEME_TYPE(unless_evt), scheme_progress_evt_type)
-        && SCHEME_SEMAP(SCHEME_PTR2_VAL(unless_evt))
-        && scheme_try_plain_sema(SCHEME_PTR2_VAL(unless_evt)))
-      return 0;
+    /* check progress evt before checking for closed; `unless_evt` is
+       unwrapped to its semaphore after the first iteration: */
+    if (unless_evt) {
+      Scheme_Object *usema = unless_evt;
+      if (SAME_TYPE(SCHEME_TYPE(usema), scheme_progress_evt_type))
+        usema = SCHEME_PTR2_VAL(usema);
+      if (SCHEME_SEMAP(usema) && scheme_try_plain_sema(usema))
+        return total_got;
+    }
 
     CHECK_PORT_CLOSED(who, "input", port, ip->closed);
 
@@ -1160,8 +1189,16 @@ intptr_t scheme_get_byte_string_unless(const char *who,
       }
     }
 
+    if (recheck_peeked && peek && !ps) {
+      /* Another thread read or peeked while we were blocked, so the
+         bytes that we want next may have been moved to the peek
+         buffer; look there again, counting from the start: */
+      peek_skip = scheme_bin_plus(orig_peek_skip, scheme_make_integer(total_got));
+    } else
+      recheck_peeked = 0;
+
     if ((ip->ungotten_count || pipe_char_count(ip->peeked_read))
-	&& (!total_got || !peek)) {
+	&& (!total_got || !peek || recheck_peeked)) {
       intptr_t l, i;
       unsigned char *s;
 
@@ -1191,6 +1228,8 @@ intptr_t scheme_get_byte_string_unless(const char *who,
       s = NULL;
 
       if (!peek) {
+        if ((i != ip->ungotten_count) && ip->progress_evt)
+          post_progress(ip);
 	ip->ungotten_count = i;
         ip->slow = 1;
       }
@@ -1204,14 +1243,30 @@ intptr_t scheme_get_byte_string_unless(const char *who,
 	    l = size;
 
 	  if (l) {
-	    scheme_get_byte_string("depipe", ip->peeked_read,
-				   buffer, offset + got, l,
-				   1, peek, peek_skip);
-	    size -= l;
-	    got += l;
-	    peek_skip = scheme_make_integer(0);
-	    if (!peek && ip->progress_evt)
-	      post_progress(ip);
+            intptr_t n;
+            /* Don't block, and pass along `unless_evt`, since a
+               thread swap is possible in the nested call; that way,
+               we don't copy into `buffer` after a progress evt is
+               ready (which a caller can rely on to share a buffer
+               across threads), and we don't wait on the peek
+               pipe after another thread drains it */
+	    n = scheme_get_byte_string_unless("depipe", ip->peeked_read,
+                                              buffer, offset + got, l,
+                                              2, peek, peek_skip,
+                                              unless_evt);
+            if (n < l) {
+              /* Progress evt became ready or another thread took
+                 peeked bytes; try again */
+              depipe_short = 1;
+              l = (n > 0) ? n : 0;
+            }
+	    if (l) {
+              size -= l;
+              got += l;
+              peek_skip = scheme_make_integer(0);
+              if (!peek && ip->progress_evt)
+                post_progress(ip);
+            }
 	  }
 	} else
 	  peek_skip = scheme_bin_minus(peek_skip, scheme_make_integer(l));
@@ -1257,7 +1312,8 @@ intptr_t scheme_get_byte_string_unless(const char *who,
        we haven't gotten anything so far, it means that we need to read before we
        can actually peek. Handle this case with a recursive peek that starts
        from the current position, then set peek_skip to 0 and go on. */
-    while (peek && !ps && (peek_skip != scheme_make_integer(0)) && !total_got && !got
+    while (peek && !ps && (peek_skip != scheme_make_integer(0))
+           && (!total_got || recheck_peeked) && !got
 	   && (ip->pending_eof < 2)) {
       char *tmp;
       int v, pcc;
@@ -1307,7 +1363,11 @@ intptr_t scheme_get_byte_string_unless(const char *who,
       }
     }
 
-    if (size) {
+    /* If the peek pipe had fewer bytes than expected, start over
+       to look at the peek pipe again: */
+    recheck_peeked = depipe_short;
+
+    if (size && !depipe_short) {
       int nonblock;
 
       if (only_avail == 2) {
@@ -1335,12 +1395,13 @@ intptr_t scheme_get_byte_string_unless(const char *who,
 	   an "unless" to detect other accesses of the port
 	   if we block. */
 	Scheme_Object *unless;
-	  
+        int notified = 0;
+
 	if (nonblock > 0) {
-	  if (ip->unless)
-	    unless = ip->unless;
-	  else
-	    unless = NULL;
+          /* We won't block, so there's no need to register. If we
+             get anything, threads that are registered are notified
+             below. */
+          unless = NULL;
 	} else if (ip->unless_cache) {
 	  if (ip->unless) {
 	    unless = ip->unless;
@@ -1373,26 +1434,42 @@ intptr_t scheme_get_byte_string_unless(const char *who,
 
 	/* Let other threads know that something happened,
 	   and/or deregister this thread's request for information. */
-	if (unless && ip->unless_cache) {
-	  if (!SCHEME_CAR(unless)) {
-	    /* Recycle "unless", since we were the only user */
-	    ip->unless_cache = unless;
-	    SCHEME_CDR(unless) = NULL;
-	  } else {
-	    if (SCHEME_TRUEP(SCHEME_CAR(unless))) {
-	      /* gc should be SCHEME_UNLESS_READY; only a user
-		 port without a peek can incorrectly produce something 
-		 else */
-	      if (gc == SCHEME_UNLESS_READY) {
-		gc = 0;
-	      }
-	    } else if (gc) {
-	      /* Notify other threads that something happened */
-	      SCHEME_CAR(unless) = scheme_true;
-	    }
-	  }
-	  ip->unless = NULL;
+	if (ip->unless_cache) {
+          if (unless) {
+            if (SCHEME_CAR(unless) && SCHEME_TRUEP(SCHEME_CAR(unless))) {
+              /* Another thread got something or made progress while
+                 we were blocked, and it removed the registration;
+                 `ip->unless` may now belong to other threads, so
+                 leave it alone. gc should be SCHEME_UNLESS_READY. */
+              notified = 1;
+            } else if (SAME_OBJ(unless, ip->unless)) {
+              if (!SCHEME_CAR(unless)) {
+                /* Recycle "unless", since we were the only user */
+                ip->unless_cache = unless;
+                SCHEME_CDR(unless) = NULL;
+                ip->unless = NULL;
+              } else if (gc) {
+                /* Notify other threads that something happened */
+                SCHEME_CAR(unless) = scheme_true;
+                ip->unless = NULL;
+              }
+            }
+          }
+          if (gc && (gc != SCHEME_UNLESS_READY) && ip->unless) {
+            /* We got something without sharing the registration
+               of threads that are blocked, so notify them */
+            SCHEME_CAR(ip->unless) = scheme_true;
+            ip->unless = NULL;
+          }
 	}
+
+        if ((gc == SCHEME_UNLESS_READY) && notified) {
+          /* Unless our own progress evt is ready, which is checked
+             at the start of the loop, we need to try again --- but
+             the bytes that we want may now be in the peek buffer */
+          gc = 0;
+          recheck_peeked = 1;
+        }
       }
 
       if (gc == SCHEME_SPECIAL) {
@@ -1550,21 +1627,13 @@ static void release_input_lock_and_elect_new_leader(Scheme_Input_Port *ip)
   scheme_post_sema_all(ip->input_lock);
   ip->input_lock = NULL;
   ip->input_giveup = NULL;
+  ip->direct_read_waiting = 0;
 
   if (ip->input_extras_ready) {
     scheme_post_sema_all(ip->input_extras_ready);
     ip->input_extras = NULL;
     ip->input_extras_ready = NULL;
   }
-}
-
-static void do_release_input_lock_and_elect_new_leader(void *_ip)
-{
-  Scheme_Input_Port *ip;
-
-  ip = scheme_input_port_record(_ip);
-
-  release_input_lock_and_elect_new_leader(ip);
 }
 
 static void check_suspended()
@@ -1707,16 +1776,89 @@ static Scheme_Object *return_data(void *data, int argc, Scheme_Object **argv)
   return (Scheme_Object *)data;
 }
 
+typedef struct {
+  /* All pointer content, so it cal be allocated with `scheme_malloc` */
+  Scheme_Input_Port *ip;
+  Syncing *syncing; /* Syncing for the leader's and other threads' targets,
+                       or NULL after an escape has been handled */
+  Scheme_Object *commit_size; /* size of leader's commit as a fixnum */
+  Scheme_Object **other_commits; /* array of records for other threads' commits, in
+                                    the same order as the Syncing's evts after the
+                                    first three */
+} Leader_Sync_State;
+
+static int complete_selected_commit(Leader_Sync_State *cd)
+/* Returns -1 if the sync has not selected a commit's target.
+   Otherwise, releases the input lock, completes the commit, and
+   returns 1 if the commit was the leader's own or 0 if it was
+   another thread's. */
+{
+  Scheme_Input_Port *ip = cd->ip;
+  Syncing *syncing = cd->syncing;
+  Scheme_Object *v;
+  intptr_t size;
+  int i;
+
+  i = syncing->result - 1;
+
+  if (i == 0) {
+    size = SCHEME_INT_VAL(cd->commit_size);
+    release_input_lock_and_elect_new_leader(ip);
+    return complete_peeked_read_via_get(ip, size);
+  } else if (i >= 3) {
+    /* Clear the cdr to tell the relevant thread that it was
+       selected, and reset the extras. */
+    v = cd->other_commits[i - 3];
+    SCHEME_CDR(v) = NULL;
+    size = SCHEME_INT_VAL(SCHEME_CAR(v));
+    release_input_lock_and_elect_new_leader(ip);
+    if (complete_peeked_read_via_get(ip, size))
+      SCHEME_CAR(v) = scheme_true;
+    else
+      SCHEME_CAR(v) = scheme_false;
+    return 0;
+  } else
+    return -1;
+}
+
+static void escape_during_commit(void *_cd)
+/* The leader is escaping (due to a break, for example) or being
+   killed. If a target was selected already, then the selection is
+   visible to other threads, so the commit must be completed. */
+{
+  Leader_Sync_State *cd = (Leader_Sync_State *)_cd;
+  Syncing *syncing = cd->syncing;
+
+  if (syncing) {
+    if (!syncing->result)
+      scheme_escape_during_sync(syncing);
+
+    if (complete_selected_commit(cd) < 0)
+      release_input_lock_and_elect_new_leader(cd->ip);
+
+    cd->syncing = NULL;
+  }
+}
+
+static int commit_syncing_ready(Syncing *syncing, Scheme_Schedule_Info *sinfo)
+{
+  return scheme_syncing_ready(syncing, sinfo, 1);
+}
+
 int scheme_peeked_read_via_get(Scheme_Input_Port *ip,
 			       intptr_t _size,
 			       Scheme_Object *unless_evt,
 			       Scheme_Object *_target_evt)
 {
   Scheme_Object * volatile v, *sema, *a[3], ** volatile aa, * volatile l;
+  Scheme_Object ** volatile vs;
   volatile intptr_t size = _size;
   volatile int n, current_leader = 0;
   volatile Scheme_Type t;
   Scheme_Object * volatile target_evt = _target_evt;
+  Syncing * volatile syncing;
+  Leader_Sync_State * volatile cd;
+  intptr_t *sizep;
 
   /* Check whether t's event value is known to be always itself: */
   t = SCHEME_TYPE(target_evt);
@@ -1821,14 +1963,17 @@ int scheme_peeked_read_via_get(Scheme_Input_Port *ip,
 	  n++;
 	}
 	aa = MALLOC_N(Scheme_Object *, n);
+	vs = MALLOC_N(Scheme_Object *, n - 3);
 	n = 3;
 	for (l = ip->input_extras; l; l = SCHEME_CDR(l)) {
+	  vs[n - 3] = SCHEME_CAR(l);
 	  aa[n++] = SCHEME_CDR(SCHEME_CAR(l));
 	}
       } else {
 	/* This is the only thread trying to commit */
 	n = 3;
 	aa = a;
+	vs = NULL;
       }
 
       /* Suspend here is a problem if another thread
@@ -1841,42 +1986,49 @@ int scheme_peeked_read_via_get(Scheme_Input_Port *ip,
       v = scheme_get_thread_suspend(scheme_current_thread);
       aa[2] = v;
 
+      /* Sync in a way that's similar to scheme_sync(), but keep the
+         Syncing record so that a selected commit can be completed
+         even if this thread is killed or it escapes (due to a break,
+         for example) after the selection but before it is swapped
+         back in. A selection can be made by another thread, such as
+         one that receives on a channel for a channel-put target, and
+         the commit and selection must be atomic. */
+      syncing = scheme_make_syncing(n, aa);
+      cd = (Leader_Sync_State *)scheme_malloc(sizeof(Leader_Sync_State));
+      cd->ip = ip;
+      cd->syncing = syncing;
+      cd->commit_size = scheme_make_integer(size);
+      cd->other_commits = vs;
+
       scheme_current_thread->running |= MZTHREAD_NEED_SUSPEND_CLEANUP;
-      BEGIN_ESCAPEABLE(do_release_input_lock_and_elect_new_leader, ip);
-      v = scheme_sync(n, aa);
+      BEGIN_ESCAPEABLE(escape_during_commit, cd);
+      scheme_block_until((Scheme_Ready_Fun)commit_syncing_ready,
+                         (Scheme_Needs_Wakeup_Fun)scheme_syncing_needs_wakeup,
+                         (Scheme_Object *)syncing, 0.0);
       END_ESCAPEABLE();
 
       if (scheme_current_thread->running & MZTHREAD_NEED_SUSPEND_CLEANUP)
         scheme_current_thread->running -= MZTHREAD_NEED_SUSPEND_CLEANUP;
 
-      if (SAME_OBJ(v, target_evt)) {
+      if (!syncing->result) {
+        scheme_conclude_sync(syncing, -1);
+        scheme_post_syncing_nacks(syncing);
+      }
+
+      {
+        /* Check whether our target or another thread's was selected: */
 	int r;
-        release_input_lock_and_elect_new_leader(ip);
-	r = complete_peeked_read_via_get(ip, size);
-	check_suspended();
-	return r;
-      } else if (SAME_OBJ(v, ip->input_giveup)) {
+	r = complete_selected_commit(cd);
+	if (r >= 0) {
+	  check_suspended();
+	  return r;
+	}
+      }
+
+      if (syncing->result == 2) {
         /* need to reset give-up semaphore so we can be woken again */
         sema = scheme_make_sema(0);
         ip->input_giveup = sema;
-      } else if (n > 3) {
-	/* Check whether one of the others was selected: */
-	for (l = ip->input_extras; l; l = SCHEME_CDR(l)) {
-	  if (SAME_OBJ(v, SCHEME_CDR(SCHEME_CAR(l)))) {
-	    /* Yep. Clear the cdr to tell the relevant thread
-	       that it was selected, and reset the extras. */
-	    v = SCHEME_CAR(l);
-	    SCHEME_CDR(v) = NULL;
-	    size = SCHEME_INT_VAL(SCHEME_CAR(v));
-	    release_input_lock_and_elect_new_leader(ip);
-	    if (complete_peeked_read_via_get(ip, size))
-	      SCHEME_CAR(v) = scheme_true;
-	    else
-	      SCHEME_CAR(v) = scheme_false;
-	    check_suspended();
-	    return 0;
-	  }
-	}
       }
 
       if (scheme_current_thread->running & MZTHREAD_USER_SUSPENDED) {
@@ -1896,11 +2048,8 @@ int scheme_peeked_read_via_get(Scheme_Input_Port *ip,
              to give it a chance */
           current_leader = 0;
           release_input_lock_and_elect_new_leader(ip);
+          scheme_thread_block(0.0);
         }
-
-	scheme_thread_block(0.0);
-
-        ip->direct_read_waiting = 0;
       }
     }
   }
@@ -2160,11 +2309,15 @@ static intptr_t get_one_byte_slow(const char *who,
   if (ip->ungotten_count) {
     buffer[offset] = ip->ungotten[--ip->ungotten_count];
     gc = 1;
+    if (ip->progress_evt)
+      post_progress(ip);
   } else if (ip->peeked_read && pipe_char_count(ip->peeked_read)) {
     int ch;
     ch = scheme_get_byte(ip->peeked_read);
     buffer[offset] = ch;
     gc = 1;
+    if (ip->progress_evt)
+      post_progress(ip);
   } else if (ip->ungotten_special) {
     if (ip->progress_evt)
       post_progress(ip);
@@ -2188,10 +2341,13 @@ static intptr_t get_one_byte_slow(const char *who,
       if (!ip->progress_evt && !ip->p.count_lines)
         ip->slow = 0;
 
-      /* Call port's get function. */
+      /* Call port's get function. If other threads can peek via the
+         port's get function, then don't block here, because blocking
+         needs to go through the general function to find out when
+         another thread moves bytes into the peek buffer. */
       gs = ip->get_string_fun;
 
-      gc = gs(ip, buffer, offset, 1, 0, NULL);
+      gc = gs(ip, buffer, offset, 1, (ip->unless_cache ? 1 : 0), NULL);
 	
       if (ip->progress_evt && (gc > 0))
         post_progress(ip);
@@ -2246,7 +2402,9 @@ static MZ_INLINE intptr_t get_one_byte(GC_CAN_IGNORE const char *who,
 
       gs = ip->get_string_fun;
 
-      v = gs(ip, buffer, 0, 1, 0, NULL);
+      /* as in get_one_byte_slow(), block only if no other thread can
+         peek via the port's get function: */
+      v = gs(ip, buffer, 0, 1, (ip->unless_cache ? 1 : 0), NULL);
     
       if (v) {
         if (v == SCHEME_SPECIAL) {
@@ -4939,6 +5097,13 @@ static intptr_t fd_get_string_slow(Scheme_Input_Port *port,
       bc = rktio_read(scheme_rktio, fip->fd, target + target_offset, target_size);
     }
 
+    if (bc && (bc != RKTIO_READ_ERROR)
+        && !rktio_fd_is_regular_file(scheme_rktio, fip->fd)) {
+      /* Since we took input, the file descriptor might not become
+         ready for other threads that are waiting on it */
+      scheme_wake_fd_readers(fip->fd);
+    }
+
     if (bc == 0)
       none_avail = 1;
     else if (bc == RKTIO_READ_EOF)
@@ -7251,6 +7416,42 @@ static Scheme_Object *terminal_write_char(int argc, Scheme_Object **argv) {
   return scheme_make_integer(width);
 }
 
+static Scheme_Object *terminal_write_chars(int argc, Scheme_Object **argv) {
+  Scheme_Object *s = argv[0];
+  intptr_t len = SCHEME_CHAR_STRLEN_VAL(s), i;
+#ifdef WIN32
+  HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+  if (h != INVALID_HANDLE_VALUE) {
+    intptr_t surrogate_pairs = 0, j;
+    wchar_t *utf_16;
+    DWORD n;
+
+    for (i = 0; i < len; i++) {
+      if ((SCHEME_CHAR_STR_VAL(s)[i]) >= 0x10000)
+        surrogate_pairs++;
+    }
+    utf_16 = scheme_malloc_atomic((len + surrogate_pairs) * sizeof(wchar_t));
+    for (i = 0, j = 0; i < len; i++) {
+      int ch = SCHEME_CHAR_STR_VAL(s)[i];
+      if (ch >= 0x10000) {
+        ch -= 0x10000;
+        utf_16[j++] = (0xD800 + (ch >> 10));
+        utf_16[j++] = (0xDC00 + (ch & 0x3FF));
+      } else
+        utf_16[j++] = ch;
+    }
+    WriteConsoleW(h, utf_16, j, &n, NULL);
+  }
+#else
+  for (i = 0; i < len; i++) {
+# if MZ_EXPR_EDIT
+    s_ee_write_char((SCHEME_CHAR_STR_VAL(s)[i]));
+# endif
+  }
+#endif
+  return scheme_void;
+}
+
 static Scheme_Object *terminal_char_width(int argc, Scheme_Object **argv) {
   int width = 1;
 #if MZ_EXPR_EDIT
@@ -7438,6 +7639,7 @@ void scheme_init_terminal(Scheme_Startup_Env *env) {
   ADDTO_EE("terminal-read-char", terminal_read_char, 1);
   ADDTO_EE("terminal-pending-winch?", terminal_pending_winch, 0);
   ADDTO_EE("terminal-write-char", terminal_write_char, 1);
+  ADDTO_EE("terminal-write-chars", terminal_write_chars, 1);
   ADDTO_EE("terminal-char-width", terminal_char_width, 1);
   ADDTO_EE("terminal-set-color", terminal_set_color, 2);
   ADDTO_EE("terminal-flush", terminal_flush, 0);

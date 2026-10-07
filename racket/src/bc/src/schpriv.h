@@ -1165,6 +1165,8 @@ typedef struct Scheme_Struct_Type {
 
   Scheme_Object *guard;
 
+  struct Scheme_Object *metaobj;
+
 #if defined(MZ_GC_BACKTRACE) && defined(MZ_PRECISE_GC)
   intptr_t current_instance_count;
   intptr_t current_instance_sizes;
@@ -1183,6 +1185,8 @@ typedef struct Scheme_Struct_Type {
 #define STRUCT_TYPE_FLAG_SYSTEM_OPAQUE       0x2
 #define STRUCT_TYPE_FLAG_AUTHENTIC           0x4
 #define STRUCT_TYPE_FLAG_SEALED              0x8
+#define STRUCT_TYPE_FLAG_META               0x10
+#define STRUCT_TYPE_FLAG_MAKES_AUTHENTIC    0x20
 
 typedef struct Scheme_Structure
 {
@@ -2625,6 +2629,7 @@ XFORM_NONGCING double scheme_double_atan2(double v, double v2);
 XFORM_NONGCING double scheme_double_log(double x);
 XFORM_NONGCING double scheme_double_exp(double x);
 XFORM_NONGCING double scheme_double_expt(double x, double y);
+XFORM_NONGCING double scheme_double_hypot(double x, double y);
 
 /***** extflonums *****/
 #ifdef MZ_LONG_DOUBLE
@@ -3793,6 +3798,7 @@ void scheme_release_fd_semaphores(void);
 
 void scheme_check_fd_semaphores(void);
 Scheme_Object *scheme_rktio_fd_to_semaphore(struct rktio_fd_t *fd, int mode);
+void scheme_wake_fd_readers(struct rktio_fd_t *fd);
 
 struct rktio_envvars_t;
 struct rktio_envvars_t *scheme_environment_variables_to_envvars(Scheme_Object *ev);

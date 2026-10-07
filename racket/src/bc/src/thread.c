@@ -365,6 +365,13 @@ static Scheme_Object *thread_cell_get(int argc, Scheme_Object *args[]);
 static Scheme_Object *thread_cell_set(int argc, Scheme_Object *args[]);
 static Scheme_Object *thread_cell_values(int argc, Scheme_Object *args[]);
 static Scheme_Object *is_thread_cell_values(int argc, Scheme_Object *args[]);
+static Scheme_Object *thread_w_details_x(Scheme_Object *thunk,
+                                         Scheme_Config *config,
+                                         Scheme_Thread_Cell_Table *cells,
+                                         Scheme_Object *break_cell,
+                                         Scheme_Custodian *mgr,
+                                         int suspend_to_kill,
+                                         Scheme_Object *results);
 
 static Scheme_Object *make_security_guard(int argc, Scheme_Object *argv[]);
 static Scheme_Object *security_guard_p(int argc, Scheme_Object *argv[]);
@@ -2566,6 +2573,21 @@ static Scheme_Thread *make_thread(Scheme_Config *config,
 #endif
     process->stack_start = stack_base;
 
+#ifdef MZ_USE_PSEUDORANDOM_FUEL
+    {
+      /* Seed the fuel generator from PLT_FUEL_SEED, if set, so that
+         different runs can explore different thread schedules while
+         still allowing a run to be reproduced from its seed */
+      char *seed;
+      seed = getenv("PLT_FUEL_SEED");
+      if (seed) {
+        unsigned long v;
+        v = strtoul(seed, NULL, 10);
+        srandom((unsigned int)v);
+      }
+    }
+#endif
+
   } else {
     prefix = 1;
   }
@@ -3478,7 +3500,8 @@ static Scheme_Object *make_subprocess(Scheme_Object *child_thunk,
 				      Scheme_Thread_Cell_Table *cells,
 				      Scheme_Object *break_cell,
 				      Scheme_Custodian *mgr,
-				      int normal_kill)
+				      int normal_kill,
+                                      Scheme_Object *init_results)
 {
   Scheme_Thread *child;
   int turn_on_multi;
@@ -3515,6 +3538,7 @@ static Scheme_Object *make_subprocess(Scheme_Object *child_thunk,
   child = make_thread(config, cells, break_cell, mgr, child_start);
   if (name_sym)
     child->name = name_sym;
+  child->results = init_results;
 
   {
     Scheme_Object *v;
@@ -3542,7 +3566,12 @@ static Scheme_Object *make_subprocess(Scheme_Object *child_thunk,
 
 Scheme_Object *scheme_thread(Scheme_Object *thunk)
 {
-  return scheme_thread_w_details(thunk, NULL, NULL, NULL, NULL, 0);
+  return thread_w_details_x(thunk, NULL, NULL, NULL, NULL, 0, NULL);
+}
+
+static Scheme_Object *thread_w_results(Scheme_Object *thunk, Scheme_Object *results)
+{
+  return thread_w_details_x(thunk, NULL, NULL, NULL, NULL, 0, results);
 }
 
 static int extract_keep_results(const char *who, int i, int argc, Scheme_Object *args[])
@@ -3566,10 +3595,7 @@ static Scheme_Object *sch_thread(int argc, Scheme_Object *args[])
   scheme_custodian_check_available(NULL, who, "thread");
   keep_results = extract_keep_results(who, 1, argc, args);
 
-  p = scheme_thread(args[0]);
-
-  if (keep_results)
-    ((Scheme_Thread *)p)->results = scheme_true;
+  p = thread_w_results(args[0], keep_results ? scheme_true : NULL);
 
   return p;
 }
@@ -3578,12 +3604,13 @@ static Scheme_Object *unsafe_thread_at_root(int argc, Scheme_Object *args[])
 {
   scheme_check_proc_arity("unsafe-thread-at-root", 0, 0, argc, args);
 
-  return scheme_thread_w_details(args[0],
-                                 scheme_minimal_config(),
-                                 scheme_empty_cell_table(),
-                                 NULL, /* default break cell */
-                                 main_custodian,
-                                 0);
+  return thread_w_details_x(args[0],
+                            scheme_minimal_config(),
+                            scheme_empty_cell_table(),
+                            NULL, /* default break cell */
+                            main_custodian,
+                            0,
+                            NULL);
 }
 
 static Scheme_Object *sch_thread_nokill(int argc, Scheme_Object *args[])
@@ -3591,7 +3618,7 @@ static Scheme_Object *sch_thread_nokill(int argc, Scheme_Object *args[])
   scheme_check_proc_arity("thread/suspend-to-kill", 0, 0, argc, args);
   scheme_custodian_check_available(NULL, "thread/suspend-to-kill", "thread");
 
-  return scheme_thread_w_details(args[0], NULL, NULL, NULL, NULL, 1);
+  return thread_w_details_x(args[0], NULL, NULL, NULL, NULL, 1, NULL);
 }
 
 Scheme_Object *scheme_thread_parallel(int argc, Scheme_Object *args[])
@@ -3616,10 +3643,7 @@ Scheme_Object *scheme_thread_parallel(int argc, Scheme_Object *args[])
   }
   keep_results = extract_keep_results(who, 2, argc, args);
 
-  p = scheme_thread(args[0]);
-
-  if (keep_results)
-    ((Scheme_Thread *)p)->results = scheme_true;
+  p = thread_w_results(args[0], keep_results ? scheme_true : NULL);
 
   return p;
 }
@@ -3762,7 +3786,7 @@ int scheme_is_stack_too_shallow()
 static Scheme_Object *thread_k(void)
 {
   Scheme_Thread *p = scheme_current_thread;
-  Scheme_Object *thunk, *result, *break_cell;
+  Scheme_Object *thunk, *result, *break_cell, *init_results;
   Scheme_Config *config;
   Scheme_Custodian *mgr;
   Scheme_Thread_Cell_Table *cells;
@@ -3773,6 +3797,8 @@ static Scheme_Object *thread_k(void)
   mgr = (Scheme_Custodian *)p->ku.k.p3;
   cells = (Scheme_Thread_Cell_Table *)SCHEME_CAR((Scheme_Object *)p->ku.k.p4);
   break_cell = SCHEME_CDR((Scheme_Object *)p->ku.k.p4);
+  init_results = SCHEME_CDR(break_cell);
+  break_cell = SCHEME_CAR(break_cell);
 
   p->ku.k.p1 = NULL;
   p->ku.k.p2 = NULL;
@@ -3780,7 +3806,8 @@ static Scheme_Object *thread_k(void)
   p->ku.k.p4 = NULL;
   
   result = make_subprocess(thunk, PROMPT_STACK(result),
-			   config, cells, break_cell, mgr, !suspend_to_kill);
+			   config, cells, break_cell, mgr, !suspend_to_kill,
+                           init_results);
 
   /* Don't get rid of `result'; it keeps the
      Precise GC xformer from "optimizing" away
@@ -3790,12 +3817,13 @@ static Scheme_Object *thread_k(void)
 
 #endif /* DO_STACK_CHECK */
 
-Scheme_Object *scheme_thread_w_details(Scheme_Object *thunk, 
-				       Scheme_Config *config, 
-				       Scheme_Thread_Cell_Table *cells,
-				       Scheme_Object *break_cell,
-				       Scheme_Custodian *mgr, 
-				       int suspend_to_kill)
+static Scheme_Object *thread_w_details_x(Scheme_Object *thunk,
+                                         Scheme_Config *config,
+                                         Scheme_Thread_Cell_Table *cells,
+                                         Scheme_Object *break_cell,
+                                         Scheme_Custodian *mgr,
+                                         int suspend_to_kill,
+                                         Scheme_Object *init_results)
 {
   Scheme_Object *result;
 #ifndef MZ_PRECISE_GC
@@ -3811,7 +3839,9 @@ Scheme_Object *scheme_thread_w_details(Scheme_Object *thunk,
     p->ku.k.p1 = thunk;
     p->ku.k.p2 = config;
     p->ku.k.p3 = mgr;
-    result = scheme_make_pair((Scheme_Object *)cells, break_cell);
+    result = scheme_make_pair((Scheme_Object *)cells,
+                              scheme_make_pair(break_cell,
+                                               init_results));
     p->ku.k.p4 = result;
     p->ku.k.i1 = suspend_to_kill;
 
@@ -3820,12 +3850,29 @@ Scheme_Object *scheme_thread_w_details(Scheme_Object *thunk,
 #endif
 
   result = make_subprocess(thunk, PROMPT_STACK(stack_marker),
-			   config, cells, break_cell, mgr, !suspend_to_kill);
+			   config, cells, break_cell, mgr, !suspend_to_kill,
+                           init_results);
 
   /* Don't get rid of `result'; it keeps the
      Precise GC xformer from "optimizing" away
      the __gc_var_stack__ frame. */
   return result;
+}
+
+Scheme_Object *scheme_thread_w_details(Scheme_Object *thunk,
+				       Scheme_Config *config,
+				       Scheme_Thread_Cell_Table *cells,
+				       Scheme_Object *break_cell,
+				       Scheme_Custodian *mgr,
+				       int suspend_to_kill)
+{
+  return thread_w_details_x(thunk,
+                            config,
+                            cells,
+                            break_cell,
+                            mgr,
+                            suspend_to_kill,
+                            NULL);
 }
 
 /**************************************************************************/
@@ -4182,27 +4229,13 @@ Scheme_Object *scheme_rktio_fd_to_semaphore(rktio_fd_t *fd, int mode)
   return *(Scheme_Object **)ib;
 }
 
-static int check_fd_semaphores()
+static int post_signaled_fd_semaphores()
 {
   rktio_ltps_handle_t *h;
   int did = 0;
   void *p;
   Scheme_Object *sema;
-  double now_msecs;
 
-  if (!scheme_semaphore_fd_set)
-    return 0;
-
-#ifdef LIMIT_POLL_FREQUENCY_BY_MONOTONIC_TIME
-  /* limit how frequently we poll */
-  now_msecs = rktio_get_inexact_monotonic_milliseconds(scheme_rktio);
-  if (now_msecs <= ceil(last_sema_poll_msecs))
-    return 0;
-  last_sema_poll_msecs = now_msecs;
-#endif
-
-  rktio_ltps_poll(scheme_rktio, scheme_semaphore_fd_set);
-  
   while (1) {
     h = rktio_ltps_get_signaled_handle(scheme_rktio, scheme_semaphore_fd_set);
     if (h) {
@@ -4222,9 +4255,49 @@ static int check_fd_semaphores()
   return did;
 }
 
+static int check_fd_semaphores()
+{
+  double now_msecs;
+
+  if (!scheme_semaphore_fd_set)
+    return 0;
+
+#ifdef LIMIT_POLL_FREQUENCY_BY_MONOTONIC_TIME
+  /* limit how frequently we poll */
+  now_msecs = rktio_get_inexact_monotonic_milliseconds(scheme_rktio);
+  if (now_msecs <= ceil(last_sema_poll_msecs))
+    return 0;
+  last_sema_poll_msecs = now_msecs;
+#endif
+
+  rktio_ltps_poll(scheme_rktio, scheme_semaphore_fd_set);
+
+  return post_signaled_fd_semaphores();
+}
+
 void scheme_check_fd_semaphores(void)
 {
   (void)check_fd_semaphores();
+}
+
+void scheme_wake_fd_readers(rktio_fd_t *fd)
+/* Wakes any thread that is blocked on a semaphore from
+   `scheme_rktio_fd_to_semaphore` to read from `fd`. A thread that
+   takes input from `fd` must use this function, because the file
+   descriptor will not become ready for the input that the thread
+   took, but other blocked threads may need to check the port's state.
+   Waking readers also wakes any thread that is waiting to write,
+   which is ok as a spurious wakeup. Beware that this function can
+   change the rktio error state. */
+{
+  if (!scheme_semaphore_fd_set)
+    return;
+
+  if (rktio_ltps_add(scheme_rktio, scheme_semaphore_fd_set, fd, RKTIO_LTPS_CHECK_READ)) {
+    /* a semaphore is registered and not yet posted */
+    (void)rktio_ltps_add(scheme_rktio, scheme_semaphore_fd_set, fd, RKTIO_LTPS_REMOVE);
+    (void)post_signaled_fd_semaphores();
+  }
 }
 
 typedef struct {
@@ -5335,6 +5408,10 @@ static int ready_unless(Scheme_Object *o)
   data = (Scheme_Object *)((void **)o)[0];
   f = (Scheme_Ready_Fun)((void **)o)[2];
 
+  /* ready if another thread made progress or got something: */
+  if (scheme_unless_ready((Scheme_Object *)((void **)o)[1]))
+    return 1;
+
   return f(data);
 }
 
@@ -5972,11 +6049,17 @@ static void suspend_thread(Scheme_Thread *p)
       scheme_thread_block(0.0);
       p->ran_some = 1;
     }
-  } else if ((running & (MZTHREAD_NEED_KILL_CLEANUP
-			 | MZTHREAD_NEED_SUSPEND_CLEANUP))
-	     && (running & MZTHREAD_SUSPENDED)) {
-    /* p probably needs to get out of semaphore-wait lines, etc. */
-    scheme_weak_resume_thread(p);
+  } else if (((running & (MZTHREAD_NEED_KILL_CLEANUP
+                          | MZTHREAD_NEED_SUSPEND_CLEANUP))
+              && (running & MZTHREAD_SUSPENDED))
+             || (running & MZTHREAD_NEED_SUSPEND_CLEANUP)) {
+    /* p probably needs to get out of semaphore-wait lines, etc.
+       In the MZTHREAD_NEED_SUSPEND_CLEANUP case, p may be runnable
+       (e.g., just woken up and not yet swapped in), and it still
+       needs to run to clean up before suspending, so leave it
+       runnable; it will suspend itself after cleaning up. */
+    if (running & MZTHREAD_SUSPENDED)
+      scheme_weak_resume_thread(p);
     p->running |= MZTHREAD_USER_SUSPENDED;
   } else {
     if (p == scheme_current_thread) {

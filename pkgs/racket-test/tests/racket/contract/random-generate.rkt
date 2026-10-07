@@ -639,3 +639,75 @@
      #:generate
      (λ (ctc) (λ (fuel) (contract-random-generate/choose number? 10)))))
   (check-not-exn (λ () (test-contract-generation (make-gen-choose/c)))))
+
+
+;; test simple seeding for current-contract-pseudo-random-generator
+(define (test-seeding ctc attempts [seed 0])
+  (define (seed-and-generate)
+    (parameterize ([current-pseudo-random-generator (current-contract-pseudo-random-generator)])
+      (random-seed seed))
+    (contract-random-generate ctc))
+
+  (define generated
+    (for/list ([i (in-range attempts)])
+      (seed-and-generate)))
+
+  (define generated1 (car generated))
+  (for ([generated2 (in-list (cdr generated))])
+    (unless (looks-similar? generated1 generated2)
+      (error 'test-seeding
+             "contract-random-generate produced different values (~e and ~e) from the same seed (~e) on contract ~e"
+             generated1
+             generated2
+             seed
+             ctc))))
+
+(define (looks-similar? v1 v2)
+  (or (equal? v1 v2)
+      ;; we cannot call the procedures, since they'll consume
+      ;; different parts of the same random stream
+      (and (procedure? v1)
+           (procedure? v2)
+           (= (procedure-arity v1) (procedure-arity v2)))))
+
+(check-not-exn (λ () (test-seeding number? 10 43)))
+(check-not-exn (λ () (test-seeding string? 10 125290)))
+(check-not-exn (λ () (test-seeding (hash/c string? integer?) 10)))
+(check-not-exn (λ () (test-seeding (integer-in -1000 1000) 10)))
+(check-not-exn (λ () (test-seeding (cons/dc [hd integer?] [tl (hd) integer?]) 10)))
+(check-not-exn (λ () (test-seeding (or/c 99 101) 100)))
+(check-not-exn (λ () (test-seeding (between/c 0 1) 100)))
+(check-not-exn (λ () (test-seeding (between/c -1 1) 100)))
+(check-not-exn (λ () (test-seeding (between/c -inf.0 1) 100)))
+(check-not-exn (λ () (test-seeding (between/c 1 +inf.0) 100)))
+(check-not-exn (λ () (test-seeding (</c 10) 100)))
+(check-not-exn (λ () (test-seeding (</c +inf.0) 100)))
+(check-not-exn (λ () (test-seeding (>/c 10) 100)))
+(check-not-exn (λ () (test-seeding (>/c -inf.0) 100)))
+(check-not-exn (λ () (test-seeding any/c 1000)))
+(check-not-exn (λ () (test-seeding (integer-in #f #f) 100)))
+(check-not-exn (λ () (test-seeding (char-in #\a #\z) 100)))
+
+;; test seeding current-contract-pseudo-random-generator directly with vector
+(define (test-seed-by-vector ctc vec)
+  (define (vector-set-and-generate)
+    (vector->pseudo-random-generator!
+     (current-contract-pseudo-random-generator)
+     vec)
+    (contract-random-generate ctc))
+
+  (define generated1 (vector-set-and-generate))
+  (define generated2 (vector-set-and-generate))
+  
+  (unless (equal? generated1 generated2)
+    (error 'test-seed-by-vector
+           "contract-random-generate produced different values (~e and ~e) from the same vector state (~e) on contract ~e"
+           generated1
+           generated2
+           vec
+           ctc)))
+
+(check-not-exn (λ () (test-seed-by-vector number? '#(725075057 2853679635 3454706443 2613380953
+                                                               675109520 2167642600))))
+(check-not-exn (λ () (test-seed-by-vector string? '#(1406683016 984745282 2427635517 3466950283
+                                                                3024258523 1696545797))))

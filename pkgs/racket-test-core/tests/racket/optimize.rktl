@@ -199,11 +199,34 @@
           [else
            (hash-ref env s s)])))))
 
+;; perform conversions that the backend can handle so that
+;; they don't change the overall compilation result
+(define (simplify-compiled e)
+  (match e
+    [`(($primitive 3 fl+) ,e)
+     (define (obviously-flonum? e fuel)
+       (match e
+         [`(($primitive ,_ ,(or 'fl+ 'fl- 'fl*)) ,e ...) #t]
+         [`(($primitive ,_ fixnum->flonum) ,_) #t]
+         [`(($primitive ,_ $real->flonum) ,_ ,_) #t]
+         [(? flonum?) #t]
+         [`(if ,_ ,thn ,els)
+          (and (not (zero? fuel))
+               (obviously-flonum? thn (sub1 fuel))
+               (obviously-flonum? els (sub1 fuel)))]
+         [_ #f]))
+     (if (obviously-flonum? e 1)
+         e
+         `(($primitive 3 fl+) ,(simplify-compiled e)))]
+    [`(,a ...)
+     (map simplify-compiled e)]
+    [_ e]))
+
 (define (comp=? c1 c2 want-same?)
   (cond
     [(eq? 'chez-scheme (system-type 'vm))
-     (let ([t1 (compile/optimize c1)]
-           [t2 (compile/optimize c2)])
+     (let ([t1 (simplify-compiled (compile/optimize c1))]
+           [t2 (simplify-compiled (compile/optimize c2))])
        (define same? (equal? t1 t2))
        (when (and (not same?) want-same?)
          (pretty-write t1)
@@ -844,20 +867,15 @@
 (test-comp '(lambda (z) (let ([f (lambda (i) (car i))]) (f z)) #t)
            '(lambda (z) (let ([f (lambda (i) (car i))]) (f z)) (pair? z)))
 
-(test-comp #:except 'chez-scheme ; real->double-flonum is not primitive
-           '(lambda (z) (fl+ z z))
+(test-comp '(lambda (z) (fl+ z z))
            '(lambda (z) (real->double-flonum (fl+ z z))))
-(test-comp #:except 'chez-scheme
-           '(lambda (z) (fl+ z z))
+(test-comp '(lambda (z) (fl+ z z))
            '(lambda (z) (exact->inexact (fl+ z z))))
-(test-comp #:except 'chez-scheme
-           '(lambda (z) (real->double-flonum z))
+(test-comp '(lambda (z) (real->double-flonum z))
            '(lambda (z) (real->double-flonum (real->double-flonum z))))
-(test-comp #:except 'chez-scheme
-           '(lambda (z) (unsafe-fx->fl (fx+ z z)))
+(test-comp '(lambda (z) (unsafe-fx->fl (fx+ z z)))
            '(lambda (z) (real->double-flonum (fx+ z z))))
-(test-comp #:except 'chez-scheme
-           '(lambda (z) (unsafe-fx->fl (fx+ z z)))
+(test-comp '(lambda (z) (unsafe-fx->fl (fx+ z z)))
            '(lambda (z) (exact->inexact (fx+ z z))))
 
 ; Test that the optimizer infers correctly the type of all the arguments
@@ -1505,8 +1523,7 @@
            '(module ? racket/base
               (define x (if (zero? (random 2)) '() '(1)))
               x))
-(test-comp #:except 'chez-scheme
-           '(lambda (x) (if (null? x) x x))
+(test-comp '(lambda (x) (if (null? x) x x))
            '(lambda (x) x))
 (test-comp #:except 'chez-scheme
            '(lambda (x) (if (null? x) null x))
@@ -1992,12 +2009,12 @@
                 (let-values ([(a b) (values (cons 1 z) (cons 2 z))])
                   (list a b)))))
            '(module m racket/base
-             ;; Reference to a ready module-level variable shouldn't
-             ;; prevent let-values splitting
              (#%plain-module-begin
               (define z (random))
               (define (f)
-                (list (cons 1 z) (cons 2 z))))))
+                (let ([x (cons 1 z)]
+                      [y (cons 2 z)])
+                  (list x y))))))
 
 (test-comp '(module m racket/base
              ;; Don't reorder references to a mutable variable
@@ -2008,14 +2025,33 @@
                   (list b a)))
               (set! z 5)))
            '(module m racket/base
-             ;; Reference to a ready module-level variable shouldn't
-             ;; prevent let-values splitting
              (#%plain-module-begin
               (define z (random))
               (define (f)
                 (list (cons 2 z) (cons 1 z)))
               (set! z 5)))
            #f)
+
+(test-comp #:except 'racket
+           '(module m racket/base
+             ;; Allow `values` splitting with nested `let` on RHS
+             (#%plain-module-begin
+              (define (f)
+                (let-values ([(a b) (let ([one (f)])
+                                      (values (cons one 0) (cons one 0)))])
+                  (list a b)))))
+           '(module m racket/base
+             (#%plain-module-begin
+              (define (f)
+                (let ([one (f)])
+                  (list (cons one 0)
+                        (cons one 0)))))))
+
+(test-comp '(module m racket/base
+              (let-values ([(vx vy) (values (add1 10) 12)])
+                (println (+ vx vy))))
+           '(module m racket/base
+              (println 23)))
 
 (test-comp #:except 'chez-scheme
            '(lambda (z)
@@ -2236,6 +2272,14 @@
                      (E (λ () T)))
              5)
            5)
+
+(test-comp '(letrec-values ([() (begin 'ok (values))]
+                            [() (let () (begin (list 1) (vector 2 3) (values)))]
+                            [(f) (lambda (x) (if (zero? x) x (f (sub1 x))))]
+                            [() (begin #'x (values))])
+              (f 10))
+           '(letrec ([f (lambda (x) (if (zero? x) x (f (sub1 x))))])
+              (f 10)))
 
 (parameterize ([compile-context-preservation-enabled 
                 ;; Avoid different amounts of unrolling
@@ -7829,6 +7873,39 @@
                 ;; is assumed unknown, and `expt` result is assumed to be used
                 (black-box (expt 2 to-power))
                 (loop (sub1 i))))))))
+
+;; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(module variable-x-is-used-too-early racket/base
+  (define (f)
+    x)
+  (define x
+    (begin0
+      f
+      (f))))
+
+(err/rt-test/once (dynamic-require ''variable-x-is-used-too-early #f)
+                  exn:fail:contract:variable?)
+
+(err/rt-test/once (let ()
+                    (define (f)
+                      x)
+                    (define x
+                      (begin0
+                        f
+                        (f)))
+                    'ok)
+                  exn:fail:contract:variable?)
+
+(err/rt-test/once (let ()
+                    (define (guard v st-info)
+                      (prop? 0))
+                    (define-values (prop prop? prop-ref)
+                      (begin0
+                        (make-struct-type-property 'name guard)
+                        (guard 1 2)))
+                    (values prop prop? prop-ref))
+                  exn:fail:contract:variable?)
 
 ;; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

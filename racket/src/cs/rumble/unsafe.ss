@@ -79,6 +79,7 @@
 (define unsafe-flatan (unsafe-primitive flatan))
 (define unsafe-fllog (unsafe-primitive fllog))
 (define unsafe-flexp (unsafe-primitive flexp))
+(define unsafe-flhypot hypot-foreign)
 (define unsafe-flsqrt (unsafe-primitive flsqrt))
 (define unsafe-flexpt (unsafe-primitive flexpt))
 
@@ -176,11 +177,11 @@
 (define unsafe-stencil-vector-update (unsafe-primitive stencil-vector-update))
 
 (define (unsafe-make-flrectangular r i)
-  (#3%make-rectangular r i))
+  (#3%fl-make-rectangular r i))
 (define (unsafe-flreal-part c)
-  (#3%real-part c))
+  (#3%cfl-real-part c))
 (define (unsafe-flimag-part c)
-  (#3%imag-part c))
+  (#3%cfl-imag-part c))
 
 (define-syntax (immutable-constant stx)
   (syntax-case stx ()

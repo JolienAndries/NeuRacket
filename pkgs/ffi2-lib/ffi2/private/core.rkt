@@ -32,6 +32,7 @@
           ffi2-cast
           ffi2-add
           ffi2-malloc
+          ffi2-new
           ffi2-free
           ffi2-sizeof
           ffi2-offsetof
@@ -56,6 +57,8 @@
          ptr_t->uintptr_t
          ptr_t->cpointer
          cpointer->ptr_t
+         ptr_t->ptr_t/gcable
+         ptr_t/gcable->ptr_t
          make-not-available
          (all-from-out "base-type.rkt"))
 
@@ -65,6 +68,7 @@
            unsafe-ffi2-procedure
            unsafe-ffi2-callback
            unsafe-ffi2-malloc
+           unsafe-ffi2-new
            unsafe-ffi2-cast
            unsafe-ffi2-add
            unsafe-ffi2-memcpy
@@ -370,7 +374,7 @@
                                     field-compound? field-ptr-vm-type
                                     field-release]
                      ...)
-                    (map (lambda (t)
+                    (map (lambda (t) 
                            (list (ffi2-type-vm-type t)
                                  (ffi2-type-defns t)
                                  (ffi2-type-c->racket t)
@@ -842,6 +846,53 @@
   (unless (ffi2-ptr? v) (raise-argument-error 'ffi2-free "ptr_t?" v))
   (ffi2-free* v))
 
+(define-for-syntax (parse-ffi2-new stx unsafe?)
+  (define (build form-id kind-stx t vals)
+    (define kind-sym (string->symbol (keyword->string (syntax-e kind-stx))))
+    (define size-vm-type (ffi2-type-vm-type t))
+    (define ptr-vm-type (let ([vm-type (ffi2-type-pointer-vm-type t)])
+                          (if (eq? kind-sym 'manual)
+                              vm-type
+                              (pointer-vm-type->gcable vm-type))))
+    (with-syntax ([(val ...) vals]
+                  [(idx ...) (for/list ([val (in-list vals)]
+                                        [i (in-naturals)])
+                               i)]
+                  [vm-type (ffi2-type-vm-type t)]
+                  [compound? (ffi2-type-compound? t)])
+      #`(let ([n #,(length vals)])
+          (let ([ptr ((#%foreign-inline (ffi2-malloc-maker #,size-vm-type #,ptr-vm-type #,kind-sym) #:copy) n)])
+            #,@(ffi2-type-defns t)
+            (define t-racket->c #,(ffi2-type-racket->c t))
+            (define t-release #,(ffi2-type-release t))
+            (define (guard v)
+              (unless (variable-reference-from-unsafe? (#%variable-reference))
+                (unless (#,(ffi2-type-predicate t) v) (bad-assign-value '#,form-id '#,(ffi2-type-name t) v)))
+              v)
+            (do-ffi2-ptr-set! compound?
+                              t-racket->c vm-type
+                              ptr
+                              (* idx (#%foreign-inline (ffi2-sizeof vm-type) #:copy))
+                              (guard val)
+                              t-release)
+            ...
+            ptr))))
+  (syntax-parse stx
+    [(form-id (~optional kind::malloc-kind)
+              (~var type (:type stx))
+              val-expr
+              ...)
+     (build #'form-id
+            #'(~? kind #:gcable)
+            (attribute type.t)
+            (attribute val-expr))]))
+
+(define-syntax (ffi2-new stx)
+  (parse-ffi2-new stx #f))
+
+(define-syntax (unsafe-ffi2-new stx)
+  (parse-ffi2-new stx #t))
+
 (define (ffi2-memcpy dest src len
                      #:dest-offset [dest-offset 0]
                      #:src-offset [src-offset 0])
@@ -1125,7 +1176,9 @@
                         (unless (variable-reference-from-unsafe? (#%variable-reference))
                           (unless (#,(ffi2-type-predicate out-t) out)
                             (bad-result 'proc-name '#,(ffi2-type-name out-t) out)))
-                        (#,(ffi2-type-racket->c out-t) out))])
+                        #,(if (ffi2-type-racket->c out-t)
+                              #`(#,(ffi2-type-racket->c out-t) out)
+                              #'(void)))])
             (let ([proc adjust-proc])
               ((#%foreign-inline (ffi2-callback-maker (__disable_interrupts conv ...)
                                                       #,(map ffi2-type-vm-type in-ts)
@@ -1169,7 +1222,9 @@
             (raise-syntax-error #f "source type is not a pointer type" stx #'from)))
         (when t
           (unless (ffi2-type-pointer? t)
-            (raise-syntax-error #f "target type is not a pointer type" stx #'to)))
+            (raise-syntax-error #f "target type is not a pointer type" stx #'to))
+          (when (ffi2-type-pointer/gcable? t)
+            (raise-syntax-error #f "target type must not be a gcable pointer type" stx #'to)))
         (define vm-type (if t (ffi2-type-vm-type t) 'pointer))
         (define gcable-vm-type (pointer-vm-type->gcable vm-type))
         #`(let ([ptr expr]
@@ -1275,3 +1330,21 @@
                           (lambda (rhs-a) rhs-a)
                           (lambda (key vals left right)
                             (list '__select key vals left right))))
+
+(define (ptr_t->ptr_t/gcable p)
+  (cond
+    [(ptr_t/gcable? p) p]
+    [else
+     (unless (ffi2-ptr? p) (raise-argument-error 'ptr_t->ptr_t/gcable "ptr_t?" p))
+     (define pp (ffi2-malloc (ffi2-sizeof ptr_t)))
+     (ffi2-set! pp ptr_t p)
+     (ffi2-ref pp (gcable_t ptr_t))]))
+
+(define (ptr_t/gcable->ptr_t p)
+  (unless (ffi2-ptr? p) (raise-argument-error 'ptr_t/gcable->ptr_t "ptr_t?" p))
+  (cond
+    [(ptr_t/gcable? p)
+     (define pp (ffi2-malloc (ffi2-sizeof ptr_t)))
+     (ffi2-set! pp ptr_t p)
+     (ffi2-ref pp ptr_t)]
+    [else p]))

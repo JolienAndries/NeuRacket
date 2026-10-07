@@ -36,7 +36,7 @@
                 i3osx ti3osx a6le ta6le a6nb ta6nb
                 a6osx ta6osx a6ios ta6ios a6fb ta6fb a6ob ta6ob a6s2 ta6s2 i3s2 ti3s2 i3qnx ti3qnx
                 arm32le tarm32le arm64le tarm64le arm64osx tarm64osx arm64ios tarm64ios rv64le trv64le
-                la64le tla64le a6hk ta6hk)
+                la64le tla64le armv7le tarmv7le a6hk ta6hk)
           'little]
          [(ppc32le tppc32le ppc32osx tppc32osx) 'big]
          [(pb tpb) (native-endianness)]
@@ -115,6 +115,25 @@
                      (eqv? (bytevector-u8-ref v 2) n))
           (errorf #f "wrong value for ~s" n)))))
 )
+
+(mat make-bytevector-implementation-restriction (parameters [optimize-level 0])
+  (let ([too-large (+ (greatest-fixnum) 1)])
+    (define (implementation-restriction? thunk)
+      (guard (c [else (and (implementation-restriction-violation? c)
+                           (equal? (condition-message c)
+                             "~s exceeds the maximum bytevector length")
+                           (equal? (condition-irritants c) (list too-large)))])
+        (thunk)
+        #f))
+    (define (assertion? thunk)
+      (guard (c [else (and (assertion-violation? c)
+                           (not (implementation-restriction-violation? c)))])
+        (thunk)
+        #f))
+    (and (implementation-restriction? (lambda () (make-bytevector too-large)))
+         (implementation-restriction? (lambda () (make-bytevector too-large 0)))
+         (assertion? (lambda () (make-bytevector -1)))
+         (assertion? (lambda () (make-bytevector -1 0))))))
 
 (mat bytevector
  ; invalid value

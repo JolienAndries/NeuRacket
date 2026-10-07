@@ -924,6 +924,23 @@
   (test (char->integer #\h) peek-byte r))
 
 ;; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Make sure that a thread blocked in a commit can give up a port
+;; so that another thread can make progress
+
+(for ([thread (in-list thread-procs)])
+  (define-values (in out) (make-pipe))
+  (write-bytes #"abc" out)
+  (define a (thread (lambda ()
+                      (peek-byte in)
+                      (port-commit-peeked 1 (port-progress-evt in) (make-semaphore) in))))
+  (sync (system-idle-evt))
+  (define ch (make-channel))
+  (thread (lambda () (channel-put ch (peek-byte in))))
+  (test (char->integer #\a) sync ch)
+  (test (char->integer #\a) read-byte in)
+  (thread-wait a))
+
+;; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;  Check that breaks are enabled properly:
 
 (let ([try
@@ -1387,6 +1404,272 @@
   (poll-proc i)
   (test #t values peeked?)
   (test #t values polled?))
+
+;; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Concurrent peeks and progress evts on a TCP port, where
+;; (in BC) a peek is implemented by reading and saving bytes
+
+(require "net-available.rkt")
+(when (tcp-localhost-available?)
+  (define (call-with-tcp-input proc)
+    (define l (tcp-listen 0 5 #t))
+    (define-values (la lp pa pp) (tcp-addresses l #t))
+    (define-values (ci co) (tcp-connect "localhost" lp))
+    (define-values (i o) (tcp-accept l))
+    (proc i co)
+    (close-input-port ci)
+    (close-output-port co)
+    (close-input-port i)
+    (close-output-port o)
+    (tcp-close l))
+
+  ;; send, and then give the bytes time to arrive and be noticed
+  (define (send bstr co)
+    (write-bytes bstr co)
+    (flush-output co)
+    (sleep 0.05)
+    (sync (system-idle-evt)))
+
+  ;; two threads peek the same bytes while they arrive in pieces
+  (call-with-tcp-input
+   (lambda (i co)
+     (define (peeker)
+       (define buf (make-bytes 2))
+       (define t (thread
+                  (lambda ()
+                    (let loop ([pos 0])
+                      (when (< pos 2)
+                        (loop (+ pos (peek-bytes-avail! buf pos #f i pos))))))))
+       (lambda () (and (sync t) buf)))
+     (define a (peeker))
+     (define b (peeker))
+     (sync (system-idle-evt))
+     (send #"a" co)
+     (send #"XY" co)
+     (test #"aX" a)
+     (test #"aX" b)
+     (test #"aXY" read-bytes 3 i)))
+
+  ;; same, but each thread's peek spans multiple arrivals
+  (call-with-tcp-input
+   (lambda (i co)
+     (define (peeker)
+       (define got #f)
+       (define t (thread (lambda () (set! got (peek-bytes 3 0 i)))))
+       (lambda () (and (sync t) got)))
+     (define a (peeker))
+     (define b (peeker))
+     (sync (system-idle-evt))
+     (for ([c (in-bytes #"abcde")])
+       (send (bytes c) co))
+     (test #"abc" a)
+     (test #"abc" b)
+     (test #"abcde" read-bytes 5 i)))
+
+  ;; a peek with a progress evt must not deliver bytes that follow
+  ;; the progress; thread `T` peeks with a progress evt, `V` peeks
+  ;; without one, and `C` consumes bytes, and the order of thread
+  ;; creation can affect which one sees newly arrived bytes first
+  (for ([order (in-list '((T V C) (T C V) (V T C) (V C T) (C T V) (C V T)))])
+    (call-with-tcp-input
+     (lambda (i co)
+       (define progress-evt (port-progress-evt i))
+       (define buf (make-bytes 4))
+       (define n #f)
+       (define ts
+         (for/list ([who (in-list order)])
+           (thread
+            (case who
+              [(T) (lambda ()
+                     (set! n (peek-bytes-avail! buf 0 progress-evt i)))]
+              [(V) (lambda ()
+                     (peek-bytes-avail! (make-bytes 6) 0 #f i))]
+              [(C) (lambda ()
+                     (peek-bytes-avail! (make-bytes 1) 0 #f i)
+                     (read-bytes 2 i))]))))
+       (sync (system-idle-evt))
+       (send #"abcdef" co)
+       (for ([t (in-list ts)])
+         (test t sync t))
+       (test progress-evt sync/timeout 0 progress-evt)
+       ;; either progress came first, or the peek got bytes from the start
+       (test #t `(peek-vs-progress ,order ,n ,buf)
+             (and n (equal? (subbytes buf 0 n) (subbytes #"abcd" 0 n)))))))
+
+  ;; reading previously peeked bytes is progress
+  (call-with-tcp-input
+   (lambda (i co)
+     (send #"abcdef" co)
+     (for ([n (in-list '(1 2))])
+       (test n bytes-length (peek-bytes n 0 i))
+       (let ([progress-evt (port-progress-evt i)])
+         (test #f sync/timeout 0 progress-evt)
+         (test 1 bytes-length (read-bytes 1 i))
+         (test progress-evt sync/timeout 0 progress-evt))
+       (let ([progress-evt (port-progress-evt i)])
+         (test #f sync/timeout 0 progress-evt)
+         (test #t byte? (read-byte i))
+         (test progress-evt sync/timeout 0 progress-evt)))))
+
+  ;; a thread that is blocked on a read or peek must notice when a
+  ;; non-blocking peek in another thread gets newly arrived bytes
+  ;; first, since the socket itself has nothing more to deliver
+  (for ([get (in-list (list (lambda (i) (peek-bytes 1 0 i))
+                            (lambda (i) (read-bytes 1 i))
+                            (lambda (i) (bytes (read-byte i)))
+                            (lambda (i) (bytes (peek-byte i)))
+                            (lambda (i) (string->bytes/utf-8 (string (read-char i))))))])
+    (call-with-tcp-input
+     (lambda (i co)
+       (define got #f)
+       (define t (thread (lambda () (set! got (get i)))))
+       (sync (system-idle-evt))
+       (write-bytes #"x" co)
+       (flush-output co)
+       ;; try to get the byte here before `t` is woken up
+       (let loop ()
+         (unless (or (thread-dead? t)
+                     (eqv? 1 (peek-bytes-avail!* (make-bytes 1) 0 #f i)))
+           (loop)))
+       (test t sync t)
+       (test #"x" values got))))
+
+  ;; a peek that is blocked with a progress evt must notice progress
+  ;; that is made by reading previously peeked bytes
+  (call-with-tcp-input
+   (lambda (i co)
+     (send #"ab" co)
+     (test #"ab" peek-bytes 2 0 i)
+     (define progress-evt (port-progress-evt i))
+     (define n #f)
+     (define t (thread (lambda ()
+                         (set! n (peek-bytes-avail! (make-bytes 1) 2 progress-evt i)))))
+     (sync (system-idle-evt))
+     (test 97 read-byte i)
+     (test t sync t)
+     (test 0 values n)
+     (test progress-evt sync/timeout 0 progress-evt)))
+
+  ;; when multiple threads try to commit, one thread (in BC) can be
+  ;; responsible for completing a commit for another thread, and
+  ;; breaking or killing the former must not lose the latter's commit
+  ;; after its evt is selected; thread `A` is stuck trying to commit
+  ;; when thread `C` starts its commit
+  (for* ([stop-thread (in-list (list void break-thread kill-thread))]
+         [mode (in-list '(channel semaphore))])
+    (call-with-tcp-input
+     (lambda (i co)
+       (send #"0123456789" co)
+       (test #"01234567" peek-bytes 8 0 i)
+       (define a
+         (thread (lambda ()
+                   (with-handlers ([exn:break? void])
+                     (port-commit-peeked 4 (port-progress-evt i) (make-semaphore) i)))))
+       (sync (system-idle-evt))
+       (define ch (make-channel))
+       (define sema (make-semaphore))
+       (define committed? #f)
+       (define c
+         (thread (lambda ()
+                   (set! committed?
+                         (port-commit-peeked 4 (port-progress-evt i)
+                                             (case mode
+                                               [(channel) (channel-put-evt ch 'c)]
+                                               [(semaphore) sema])
+                                             i)))))
+       (sync (system-idle-evt))
+       ;; select `C`'s evt, and then stop `A` before it can run again
+       (define got
+         (case mode
+           [(channel) (sync ch)]
+           [(semaphore) (semaphore-post sema) 'c]))
+       (stop-thread a)
+       (test 'c values got)
+       (test c sync c)
+       (test #t values committed?)
+       (test a sync a)
+       (test #"4567" peek-bytes 4 0 i)))))
+
+;; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Concurrent reads and peeks on an OS-level pipe, where threads
+;; may have to wait in a different way than for a TCP port
+
+(when (and (memq (system-type) '(unix macosx))
+           (file-exists? "/bin/cat"))
+  (define-values (sp stdout-in stdin-out stderr-in) (subprocess #f #f #f "/bin/cat"))
+  (define i stdout-in)
+
+  ;; multiple threads blocked on a peek of the same byte
+  (let ()
+    (define (peeker get)
+      (define got #f)
+      (define t (thread (lambda () (set! got (get)))))
+      (lambda () (and (sync t) got)))
+    (define a (peeker (lambda () (peek-bytes 1 0 i))))
+    (define b (peeker (lambda () (peek-bytes 1 0 i))))
+    (define c (peeker (lambda () (bytes (peek-byte i)))))
+    (sync (system-idle-evt))
+    (write-bytes #"x" stdin-out)
+    (flush-output stdin-out)
+    (test #"x" a)
+    (test #"x" b)
+    (test #"x" c)
+    (test #"x" read-bytes 1 i))
+
+  ;; a blocked thread versus a non-blocking peek in another thread
+  (for ([get (in-list (list (lambda () (peek-bytes 1 0 i))
+                            (lambda () (read-bytes 1 i))
+                            (lambda () (bytes (read-byte i)))))])
+    (define got #f)
+    (define t (thread (lambda () (set! got (get)))))
+    (sync (system-idle-evt))
+    (write-bytes #"y" stdin-out)
+    (flush-output stdin-out)
+    (let loop ()
+      (unless (or (thread-dead? t)
+                  (eqv? 1 (peek-bytes-avail!* (make-bytes 1) 0 #f i)))
+        (loop)))
+    (test t sync t)
+    (test #"y" values got)
+    ;; consume the byte if it was only peeked
+    (when (eqv? 1 (peek-bytes-avail!* (make-bytes 1) 0 #f i))
+      (test #"y" read-bytes 1 i)))
+
+  ;; progress via previously peeked bytes
+  (let ()
+    (write-bytes #"ab" stdin-out)
+    (flush-output stdin-out)
+    (test #"ab" peek-bytes 2 0 i)
+    (define progress-evt (port-progress-evt i))
+    (define n #f)
+    (define t (thread (lambda ()
+                        (set! n (peek-bytes-avail! (make-bytes 1) 2 progress-evt i)))))
+    (sync (system-idle-evt))
+    (test 97 read-byte i)
+    (test t sync t)
+    (test 0 values n))
+
+  (close-output-port stdin-out)
+  (test #"b" read-bytes 1 i)
+  (test eof read-bytes 1 i)
+  (close-input-port stdout-in)
+  (close-input-port stderr-in)
+  (subprocess-wait sp))
+
+;; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Regression check for commit peeked in a parallel thread
+;; in a simple case that takes a shortcut
+
+(for ([thread (in-list thread-procs)])
+  (let ([done? #f])
+    (define (work)
+      (define-values (r w) (make-pipe))
+      (write-bytes #"hello" w)
+      (peek-bytes 5 0 r)
+      (port-commit-peeked 5 (port-progress-evt r) always-evt r)
+      (set! done? #t))
+    (thread-wait (thread work))
+    (test #t values done?)))
 
 ;; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

@@ -69,6 +69,7 @@ pbarch=no
 threads=yes
 nothreads=no
 libffi=no
+w_exclusive_x=no
 temproot=""
 help=no
 forceworkarea=no
@@ -90,6 +91,7 @@ disablex11=no
 disablecurses=no
 disableiconv=no
 addflags=yes
+hardlinks=yes
 addwarningflags=no
 default_warning_flags="-Wpointer-arith -Wall -Wextra -Wno-implicit-fallthrough"
 : ${CC:="gcc"}
@@ -113,6 +115,7 @@ enableFrompb=yes
 pbendian=l
 emscripten=no
 empetite=no
+android=no
 crossCompile=no
 moreBootFiles=
 preloadBootFiles=
@@ -136,6 +139,10 @@ case "${CONFIG_UNAME}" in
     unixsuffix=le
     installprefix=/usr
     installmansuffix=share/man
+    if [ "$(uname -o)" = "Android" ]; then
+        android=yes
+        hardlinks=no
+    fi
     ;;
   GNU)
     unixsuffix=gnu # the Hurd
@@ -146,6 +153,7 @@ case "${CONFIG_UNAME}" in
     unixsuffix=hk
     installprefix=/system
     installmansuffix=documentation/man
+    hardlinks=no
     ;;
   QNX)
     if uname -m | egrep 'x86' > /dev/null 2>&1 ; then
@@ -253,6 +261,10 @@ if [ "$unixsuffix" != "" ] ; then
         m64=arm64${unixsuffix}
         tm32=tarm32${unixsuffix}
         tm64=tarm64${unixsuffix}
+        if [ "$android" = "yes" ]; then
+            m32=armv7${unixsuffix}
+            tm32=tarmv7${unixsuffix}
+        fi
     elif uname -m | grep 'riscv64' > /dev/null 2>&1 ; then
         m32=""
         m64=rv64${unixsuffix}
@@ -401,11 +413,17 @@ while [ $# != 0 ] ; do
     --enable-libffi)
       libffi=yes
       ;;
+    --enable-wx)
+      w_exclusive_x=yes
+      ;;
     --disable-auto-flags)
       addflags=no
       ;;
     --enable-warning-flags)
       addwarningflags=yes
+      ;;
+    --disable-hard-links)
+      hardlinks=no
       ;;
     --libkernel)
       Kernel=KernelLib
@@ -681,8 +699,10 @@ if [ "$help" = "yes" ]; then
   echo "  --disable-curses                  disable [n]curses support"
   echo "  --disable-iconv                   disable iconv support"
   echo "  --enable-libffi                   enable libffi support for pb"
+  echo "  --enable-wx                       support W^X by disabling __collect_safe"
   echo "  --disable-auto-flags              no auto additions to CFLAGS/LDFLAGS/LIBS"
   echo "  --enable-warning-flags            add GCC warning flags to CFLAGS"
+  echo "  --disable-hard-links              install with soft instead of hard links"
   echo "  --libkernel                       build libkernel.a (the default)"
   echo "  --kernelobj                       build kernel.o instead of libkernel.a"
   echo "  --installprefix=<pathname>        final installation root ($installprefix)"
@@ -870,6 +890,10 @@ if [ "$addflags" = "yes" ] ; then
     fi
 fi
 
+if [ "$w_exclusive_x" = "yes" ] ; then
+    CFLAGS="${CFLAGS} -DWRITE_XOR_EXECUTE_CODE"
+fi
+
 cursesLib=-lcurses
 ncursesLib=-lncurses
 
@@ -889,6 +913,9 @@ if [ "$addflags" = "yes" ] ; then
   case "${flagsm}" in
     *le|*gnu|*hk)
         LDFLAGS="${LDFLAGS} -rdynamic"
+        if [ "$android" = "yes" ]; then
+            LDFLAGS="${LDFLAGS} ${iconvLib}"
+        fi
         ;;
     *fb|*nb)
         LDFLAGS="${LDFLAGS} -rdynamic -L/usr/local/lib"
@@ -1018,7 +1045,9 @@ esac
 # pre- and post-link-executable step for c/Mf-unix
 case "${flagsmuni}" in
     *nb)
-        exePostStep='paxctl +m'
+        if [ "$w_exclusive_x" = no ]; then
+            exePostStep='paxctl +m'
+        fi
         ;;
     em)
         if [ "$empetite" = yes ]; then
@@ -1193,4 +1222,5 @@ GzipManPages=$gzipmanpages
 InstallSchemeName=$installschemename
 InstallPetiteName=$installpetitename
 InstallScriptName=$installscriptname
+InstallHardlinks=$hardlinks
 END

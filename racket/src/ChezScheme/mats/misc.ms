@@ -4711,7 +4711,7 @@
              (#2%display 1))))
 )
 
-(unless (memq (machine-type) '(arm32le tarm32le arm64le tarm64le arm64osx tarm64osx ; timestamp counter tends to be priviledged on Arm
+(unless (memq (machine-type) '(arm32le tarm32le arm64le tarm64le arm64osx tarm64osx armv7le tarmv7le ; timestamp counter tends to be priviledged on Arm
                                        arm64ios tarm64ios arm64nt tarm64nt
                                        pb pb32l pb32b pb64l pb64b tpb tpb32l tpb32b tpb64l tpb64b)) ; doesn't increment for pb
   (mat $read-time-stamp-counter
@@ -5490,7 +5490,46 @@
            (loop))))
      #t))
 
+  ;; make sure large immobile bytevectors are really immobile
+  (let loop ([i 10])
+    (cond
+      [(zero? i) #t]
+      [else
+       (let* ([bv (make-immobile-bytevector #x200000)]
+              [addr (object->reference-address bv)])
+         (collect 0 0)
+         (collect 0 1)
+         (and (eqv? addr (object->reference-address bv))
+              (loop (sub1 i))))]))
+
   )
+
+(mat immobile-implementation-restriction (parameters [optimize-level 0])
+  (let ([too-large (+ (greatest-fixnum) 1)])
+    (define (implementation-restriction? message thunk)
+      (guard (c [else (and (implementation-restriction-violation? c)
+                           (equal? (condition-message c) message)
+                           (equal? (condition-irritants c) (list too-large)))])
+        (thunk)
+        #f))
+    (define (assertion? thunk)
+      (guard (c [else (and (assertion-violation? c)
+                           (not (implementation-restriction-violation? c)))])
+        (thunk)
+        #f))
+    (and
+      (implementation-restriction? "~s exceeds the maximum vector length"
+        (lambda () (make-immobile-vector too-large)))
+      (implementation-restriction? "~s exceeds the maximum vector length"
+        (lambda () (make-immobile-vector too-large #f)))
+      (assertion? (lambda () (make-immobile-vector -1)))
+      (assertion? (lambda () (make-immobile-vector -1 #f)))
+      (implementation-restriction? "~s exceeds the maximum bytevector length"
+        (lambda () (make-immobile-bytevector too-large)))
+      (implementation-restriction? "~s exceeds the maximum bytevector length"
+        (lambda () (make-immobile-bytevector too-large 0)))
+      (assertion? (lambda () (make-immobile-bytevector -1)))
+      (assertion? (lambda () (make-immobile-bytevector -1 0))))))
 
 (mat compacting
   ;; try to provoke the GC into putting a record into marked

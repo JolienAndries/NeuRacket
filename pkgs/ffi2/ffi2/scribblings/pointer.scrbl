@@ -1,7 +1,11 @@
 #lang scribble/manual
-@(require "common.rkt"
+@(require scribble/example
+          "common.rkt"
           (for-label (only-in ffi/unsafe cpointer?)
                      (only-in racket/contract/base any/c)))
+
+@(define ffi2-eval (make-base-eval))
+@examples[#:eval ffi2-eval #:hidden (require ffi2)]
 
 @title[#:tag "pointer"]{Foreign Pointers}
 
@@ -26,7 +30,8 @@ which means that a C conversion to Racket via @racket[ptr_t] is not
 accepted by any context that expects some tag, whereas a pointer with
 any tags is accepted as a @racket[ptr_t] representation to translate
 to C. Whether a pointer object represents an address managed by
-Racket's garbage collector is independent of its tags.
+Racket's garbage collector (i.e., whether it is a @tech{gcable pointer})
+is independent of its tags.
 
 @deftogether[(
 @defproc[(ptr_t? [v any/c]) boolean?]
@@ -37,7 +42,8 @@ Racket's garbage collector is independent of its tags.
 
 The @racket[ptr_t?] or @racket[void_t*?] predicate recognizes any
 @tech{pointer} object, while @racket[ptr_t/gcable?] or
-@racket[void_t*/gcable?] recognizes a pointer object that represents a
+@racket[void_t*/gcable?] recognizes a @tech{gcable pointer} object,
+which (claims to) represent a
 reference to memory that is managed by Racket's garbage collector.
 
 }
@@ -82,7 +88,8 @@ By default, allocation uses @racket[#:gcable] mode, but a
 @itemlist[
 
  @item{@racket[#:gcable]: Allocates uninitialized memory in Racket's
-       garbage-collected space, i.e., GCable memory. The allocated
+       garbage-collected space, and the result of @racket[ffi2-malloc]
+       is a @tech{gcable pointer}. The allocated
        memory becomes eligible for garbage collection when it is not
        referenced by any reachable pointer object or @tech{traced}
        allocated memory. Even before collection, the memory manager
@@ -112,16 +119,43 @@ By default, allocation uses @racket[#:gcable] mode, but a
  @item{@racket[#:manual]: Allocates outside of Racket's
        garbage-collected space. The allocated memory is never
        relocated by the garbage collection, and it must be freed
-       explicitly with @racket[ffi2-free].}
+       explicitly with @racket[ffi2-free]. The result from
+       @racket[ffi2-malloc] in this mode is not a
+       @tech{gcable pointer} since it does not refer to Racket's
+       garbage-collected space, but the pointer object itself
+       can be garbage collected.}
 
 ]
 
 }
 
+@defform[(ffi2-new maybe-mode
+                   type
+                   val-expr ...)]{
+
+Similar to @racket[ffi2-malloc], but initializes the allocated memory
+with the result of each @racket[val-expr]. The allocated memory
+corresponds to the size of @racket[type] times the number of
+@racket[val-expr]s, and it is initialized in the same way as using
+@racket[ffi2-set!] on the allocated pointer, @racket[type], a suitable
+offset, and the result of each @racket[val-expr].
+
+@examples[
+#:eval ffi2-eval
+(define ns (ffi2-new double_t 1.0 20.0 300.0))
+ns
+(ffi2-ref ns double_t 2)
+(ffi2-ref ns double_t 0)
+]
+
+@history[#:added "1.1"]
+
+}
+
 @defproc[(ffi2-free [ptr void_t*?]) void?]{
 
-Deallocates memory that was allocated with @racket[ffi2-malloc] in
-@racket[#:manual] mode.
+Deallocates memory that was allocated with @racket[ffi2-malloc]
+or @racket[ffi2-new] in @racket[#:manual] mode.
 
 }
 
@@ -176,11 +210,18 @@ foreign type's representation to another. If @racket[from-type] or
 Both @racket[from-type] and @racket[to-type] must be pointer types,
 or they must both be @tech{scalar} types.
 
+The @racket[to-type] must not be a @racket[gcable_t] type, because
+conversion of a @tech{gcable pointer} is managed automatically. The
+result of @racket[ffi2-cast] is a gcable pointer if and only if the
+result of @racket[expr] is a gcable pointer.
+
 If the @racket[#:offset] option is provided, the resulting pointer is
 shifted to represent an address that is @racket[_n] bytes later, where
 @racket[_n] is the result of @racket[n-expr] multiplied by
 @racket[(ffi2-sizeof maybe-type)] or by @racket[1] if
-@racket[maybe-type] is empty. An @racket[#:offset] option cannot be
+@racket[maybe-type] is empty. See @secref["gcable-pointers"]
+for more information about using offset pointers.
+An @racket[#:offset] option cannot be
 provided for casting between scalar types.
 
 }
@@ -242,6 +283,18 @@ with @racket[ffi2-manual-box-ref] or changed with
 }
 
 @deftogether[(
+@defproc[(ptr_t/gcable->ptr_t [ptr ptr_t?]) ptr_t?]
+@defproc[(ptr_t->ptr_t/gcable [ptr ptr_t?]) ptr_t/gcable?]
+)]{
+
+Converts a @tech{gcable pointer} to a non-gcable pointer or vice
+versa. See also @secref["gcable-pointers"].
+
+@history[#:added "1.2"]
+
+}
+
+@deftogether[(
 @defproc[(ptr_t->uintptr_t [ptr ptr_t?]) exact-nonnegative-integer?]
 @defproc[(uintptr_t->ptr_t [int exact-nonnegative-integer?]) ptr_t?]
 )]{
@@ -254,3 +307,5 @@ collector can become immediately invalid, unless an object at the
 address was allocated as immobile.
 
 }
+
+@close-eval[ffi2-eval]

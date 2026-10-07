@@ -4192,3 +4192,12 @@ ended up returning @racket[contract-random-generate-fail].
 
 @history[#:added "6.1.1.5"]
 }
+
+@defparam[current-contract-pseudo-random-generator
+          rand-gen
+          pseudo-random-generator?]{
+ A @tech{parameter} that determines the the pseudo-random number generator
+ used by @racket[contract-random-generate] and @racket[contract-exercise].
+
+ @history[#:added "9.3.0.2"]
+}

@@ -48,7 +48,8 @@
       [(string=? arch "i3")
        (cons "I386"
              (or-windows "i3le.c"))]
-      [(string=? arch "arm32")
+      [(or (string=? arch "arm32")
+           (string=? arch "armv7"))
        (cons "ARMV6"
              "clearcache.c")]
       [(string=? arch "arm64")
@@ -175,6 +176,8 @@
   (define lib-deps (append (if zlib-system-lib '() (list zlib-lib))
                            (if lz4-system-lib '() (list lz4-lib))))
   (define res-deps (if msvc? (list res-file) '()))
+
+  (define cflags-dep (input-data-target 'cflags (lookup 'CFLAGS)))
 
   (define preload-files (get-preload-files config at-dir mboot))
 
@@ -368,7 +371,7 @@
                                      'desc "lz4 make"))]))]
 
      ,@(map (lambda (.c .o)
-              `[:target ,.o (,.c ,@kernel-hdrs ,@lib-deps)
+              `[:target ,.o (,.c ,@kernel-hdrs ,@lib-deps ,cflags-dep)
                         ,(lambda (.o target)
                            (compile-one .c .o))])
             kernel-srcs kernel-srcobjs)
@@ -393,7 +396,7 @@
             kernel-asms kernel-asmobjs)
 
      ,@(map (lambda (.c .o)
-              `[:target ,.o (,.c ,@main-hdrs)
+              `[:target ,.o (,.c ,@main-hdrs ,cflags-dep)
                         ,(lambda (.o target)
                            (compile-one .c .o))])
             main-srcs main-objs)

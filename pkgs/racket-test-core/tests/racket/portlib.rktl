@@ -162,6 +162,41 @@
   (test-pipe-commit make-pipe thread)
   (test-pipe-commit (lambda () (make-pipe-with-specials 10000 'special-pipe 'spec-pipe)) thread))
 
+;; Two threads try to commit peeked bytes with targets that never become
+;; ready, so one is the "leader" that holds the port's input lock and the
+;; other is an "extra" managed by the leader. Kill the extra (which wakes
+;; up the leader), and then break, kill, or suspend the leader at various
+;; points; afterward, the port must still be readable by another thread.
+(for ([thread (in-list thread-procs)])
+  (define (test-commit-leader-interrupt mode order k)
+    (define-values (in out) (make-pipe))
+    (write-bytes #"abc" out)
+    (define (commit-thread)
+      (thread (lambda ()
+                (with-handlers ([exn:break? void])
+                  (peek-byte in)
+                  (port-commit-peeked 1 (port-progress-evt in) (make-semaphore) in)))))
+    (define a (commit-thread))
+    (define b (commit-thread))
+    (sync (system-idle-evt))
+    (define-values (x y) (if (eq? order 'ab) (values a b) (values b a)))
+    (kill-thread x)
+    (for ([i k]) (sleep))
+    (case mode
+      [(break) (break-thread y)]
+      [(kill) (kill-thread y)]
+      [(suspend) (thread-suspend y)])
+    (sleep)
+    (define ch (make-channel))
+    (thread (lambda () (channel-put ch (peek-byte in))))
+    (test 97 sync/timeout 1 ch)
+    (kill-thread a)
+    (kill-thread b))
+  (for* ([mode '(break kill suspend)]
+         [order '(ab ba)]
+         [k (in-range 3)])
+    (test-commit-leader-interrupt mode order k)))
+
 ;; pipe-with-specials and limit; also used to test peeked-input-port
 (define (test-special-pipe make-pipe-with-specials thread)
   (let-values ([(in out) (make-pipe-with-specials 10)])
@@ -825,9 +860,7 @@
 
 (try-eip-seq "UTF-8" #f #"apple" `((#t 3 #"app") (#f 2 #"le") (#t 4 ,eof)))
 (try-eip-seq "UTF-8" #f #"ap\303\251ple" `((#t 3 #"ap\303") (#f 2 #"pl") (#t 4 #"\251e") (#t 5 ,eof)))
-(unless (and (eq? 'windows (system-type))
-             (getenv "GITHUB_ACTIONS"))
-  (try-eip-seq "ISO-8859-1" #t #"ap\303\251ple" `((#t 3 #"ap\303") (#f 2 #"\251p") (#t 4 #"\203le") (#t 5 ,eof))))
+(try-eip-seq "ISO-8859-1" #t #"ap\303\251ple" `((#t 3 #"ap\303") (#f 2 #"\251p") (#t 4 #"\203le") (#t 5 ,eof)))
 (try-eip-seq "UTF-8" #f #"ap\251ple" `((#t 2 #"ap") (#f 2 #"\251p") (#t 4 #"le") (#t 5 ,eof)))
 (try-eip-seq "UTF-8" #f #"ap\251ple" `((#t 3 #"ap.") (#f 1 #"p") (#t 4 #"!le") (#t 5 ,eof)))
 (try-eip-seq "UTF-8" #f #"ap\251ple" `((#t 4 #"ap.!") (#f 1 #"l") (#t 4 #"pe") (#t 5 ,eof)))

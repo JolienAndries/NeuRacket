@@ -627,7 +627,7 @@ static intptr_t sch_vsprintf(char *s, intptr_t maxlen, const char *msg, va_list 
 		  int i;
                   i = scheme_utf8_encode((const unsigned int *)mbuf, 0, len, NULL, 0, 1);
                   es = (char *)scheme_malloc_atomic(i + 1);
-                  (void)scheme_utf8_encode((const unsigned int *)mbuf, 0, len, es, 0, 1);
+                  (void)scheme_utf8_encode((const unsigned int *)mbuf, 0, len, (unsigned char *)es, 0, 1);
                   es[i] = 0;
 		  /* Remove newlines: */
 		  for (i = strlen(es) - 1; i > 0; i--) {
@@ -5144,6 +5144,8 @@ static Scheme_Object *exn_classify_errno(int argc, Scheme_Object *argv[])
 
   if (SCHEME_CHAPERONE_STRUCTP(p)
       && scheme_is_struct_instance(exn_table[MZEXN].type, p)) {
+    if (scheme_is_struct_instance(exn_table[MZEXN_FAIL_FILESYSTEM_EXISTS].type, p))
+      return scheme_intern_symbol("EEXIST");
     if (scheme_is_struct_instance(exn_table[MZEXN_FAIL_FILESYSTEM_ERRNO].type, p)
         || scheme_is_struct_instance(exn_table[MZEXN_FAIL_NETWORK_ERRNO].type, p))
       p = scheme_struct_ref(p, 2);

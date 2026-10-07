@@ -67,8 +67,11 @@
                 fxarithmetic-shift-left fxlshift
                 fxsll/wraparound fxlshift/wraparound
                 fxsrl fxrshift/logical
+                fl-make-rectanglular flmake-rectanglular
+                cfl-imag-part flimag-part
+                cfl-real-part flreal-part
                 exact inexact->exact
-                real->flonum ->fl
+                real->flonum real->double-flonum
                 time-utc->date seconds->date
                 make-record-type-descriptor* make-struct-type
                 atan2 atan
@@ -357,6 +360,11 @@
     "list?"]
    [(equal? str "n flvector")
     "flvector?"]
+   [(equal? str " cflonum")
+    (string-append
+     "(and/c complex?\n"
+     "                   (lambda (c) (flonum? (real-part c)))\n"
+     "                   (lambda (c) (flonum? (imag-part c))))")]
    [else
     (let* ([l (string->list str)]
            [l (cond

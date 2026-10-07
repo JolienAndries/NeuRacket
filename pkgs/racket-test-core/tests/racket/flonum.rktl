@@ -6,6 +6,14 @@
          racket/unsafe/ops
          "for-util.rkt")
 
+(define 1ary-table
+  null)
+;; note: flimag-part and flreal-part need complex numbers with inexact
+;; imaginary parts, not just flonums; we test them more in "jitinline.rktl"
+
+(define 2ary-table
+  (list (list make-flrectangular unsafe-make-flrectangular)))
+
 (define 1nary-table
   (list (list fl- unsafe-fl-)
         (list fl/ unsafe-fl/)
@@ -26,7 +34,7 @@
   (define (same-results fl unsafe-fl args)
     (test (apply fl args) apply unsafe-fl args))
 
-  (for ([line (in-list 1nary-table)])
+  (for ([line (in-list (append 1nary-table 1ary-table))])
     (test #t 'single (and ((car line) +nan.0) #t))
     (test #t 'single (and ((cadr line) +nan.0) #t)))
 
@@ -42,10 +50,18 @@
       (for ([line (in-list 1nary-table)])
         (test #t same-results (list-ref line 0) (list-ref line 1) (list i))
         (test #t same-results (list-ref line 0) (list-ref line 1) (list i j)))
+      (for ([line (in-list 2ary-table)])
+        (test #t same-results (list-ref line 0) (list-ref line 1) (list i j)))
       (for ([line (in-list (append 0nary-table 1nary-table))])
         (test #t same-results (list-ref line 0) (list-ref line 1) (list i j k))
         (test #t same-results (list-ref line 0) (list-ref line 1) (list i k j))
         (test #t same-results (list-ref line 0) (list-ref line 1) (cons i more-flonums))))))
+
+(for ([line (in-list (append 0nary-table 1nary-table 1ary-table))])
+  (err/rt-test ((list-ref line 0) "bad") exnfail:contract? (regexp (format "^~a" (list-ref line 0)))))
+(for ([line (in-list (append 0nary-table 1nary-table 2ary-table))])
+  (err/rt-test ((list-ref line 0) 0.0 "bad") exnfail:contract? (regexp (format "^~a" (list-ref line 0))))
+  (err/rt-test ((list-ref line 0) "bad" 0.0) exnfail:contract? (regexp (format "^~a" (list-ref line 0)))))
 
 (test 3.0 ->fl 3)
 (test (exact->inexact (expt 2 100)) ->fl (expt 2 100))
@@ -404,6 +420,15 @@
 
 (test -0.0 flsqrt -0.0)
 (test +nan.0 log (flsqrt -1.0))
+
+(test 5.0 flhypot 3.0 4.0)
+(test 4.9999999999999995e+200 flhypot 3e+200 4e+200)
+(test 5e-200 flhypot 3e-200 4e-200)
+(test +inf.0 flhypot +inf.0 +nan.0)
+(test +inf.0 flhypot +nan.0 +inf.0)
+(test +nan.0 flhypot +nan.0 1.0)
+(err/rt-test (flhypot 3 4.0) exn:fail:contract?)
+(err/rt-test (flhypot 3.0 4) exn:fail:contract?)
 
 ;; ----------------------------------------
 ;; `flbit-field`, based on tests in the Chez Scheme test suite

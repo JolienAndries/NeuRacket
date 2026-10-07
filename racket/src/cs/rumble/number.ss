@@ -13,8 +13,7 @@
 (define (single-flonum-available?) #f)
 
 (define/who (real->double-flonum x)
-  (check who real? x)
-  (exact->inexact x))
+  (#2%real->flonum x))
 
 (define/who (real->single-flonum x)
   (check who real? x)
@@ -77,7 +76,7 @@
      #'(let ([x x-expr]
              [n n-expr])
          (if (and (fixnum? n)
-                  (#3%fx< (fxabs n) 10000))
+                  (#3%fx< -10000 n 10000))
              (#2%expt x n)
              (general-expt x n)))]
     [(_ expr ...) #'(general-expt expr ...)]
@@ -92,11 +91,11 @@
        (#2%expt x n)]
       [(and (fixnum? n)
             (exact? x))
-       (unless (or (#3%fx< (fxabs n) 10000)
+       (unless (or (#3%fx< -10000 n 10000)
                    (eqv? x 0)
                    (eqv? x 1)
                    (eqv? x -1))
-         (guard-large-allocation 'expt 'number (fxabs n)
+         (guard-large-allocation 'expt 'number (abs n)
                                  (fxmax (integer-length (numerator (real-part x)))
                                         (integer-length (denominator (real-part x)))
                                         (integer-length (numerator (imag-part x)))
@@ -176,35 +175,25 @@
   (inexact->exact fl))
 
 (define/who (flreal-part a)
-  (or (and
-       (complex? a)
-       (not (real? a)) ; => complex imaginary part
-       (let ([r (real-part a)])
-         (and (flonum? r) r)))
-      (check who (lambda (a) #f)
-             :contract (string-append
-                        "(and/c complex?\n"
-                        "       (lambda (c) (flonum? (real-part c)))\n"
-                        "       (lambda (c) (flonum? (imag-part c))))")
-             a)))
+  (if (flonum? a) ;; =? imaginary 0 part
+      (#%$app/no-return raise-flx-part-argument-error who a)
+      (#2%cfl-real-part a)))
 
 (define/who (flimag-part a)
-  (or (and
-       (complex? a)
-       (let ([r (imag-part a)])
-         (and (flonum? r) ; => complex real part
-              r)))
-      (check who (lambda (a) #f)
-             :contract (string-append
-                        "(and/c complex?\n"
-                        "       (lambda (c) (flonum? (real-part c)))\n"
-                        "       (lambda (c) (flonum? (imag-part c))))")
-             a)))
+  (if (flonum? a) ;; =? imaginary 0 part
+      (#%$app/no-return raise-flx-part-argument-error who a)
+      (#2%cfl-imag-part a)))
+
+(define (raise-flx-part-argument-error who a)
+  (raise-argument-error who
+                        (string-append
+                         "(and/c complex?\n"
+                         "       (lambda (c) (flonum? (real-part c)))\n"
+                         "       (lambda (c) (flonum? (imag-part c))))")
+                        a))
 
 (define/who (make-flrectangular a b)
-  (check who flonum? a)
-  (check who flonum? b)
-  (make-rectangular a b))
+  (#2%fl-make-rectangular a b))
 
 (define (system-big-endian?)
   (eq? (native-endianness) (endianness big)))
@@ -419,11 +408,16 @@
              radix))
     (when (and (not (eq? radix 10)) (inexact? n))
       (raise
-       (exn:fail:contract (string-append
-                           "number->string: inexact numbers can only be printed in base 10\n"
-                           "  number: " (number->string n) "\n"
-                           "  requested base: " (number->string radix))
-                          (current-continuation-marks))))
+       (|#%app|
+        exn:fail:contract
+        (error-message->adjusted-string
+         'number->string primitive-realm
+         (string-append
+          "inexact numbers can only be printed in base 10\n"
+          "  number: " (number->string n) "\n"
+          "  requested base: " (number->string radix))
+         primitive-realm)
+        (current-continuation-marks))))
     (do-number->string n radix)]
    [(n)
     (do-number->string n 10)]))
@@ -547,6 +541,16 @@
 
 (define (fllog n) (#2%fllog n))
 (define (flatan n) (#2%flatan n))
+
+(define hypot-foreign
+  (foreign-procedure __atomic "(cs)hypot" (double-float double-float) double-float))
+
+(define (flhypot x y)
+  (unless (flonum? x)
+    (raise-argument-error 'flhypot "flonum?" 0 x y))
+  (unless (flonum? y)
+    (raise-argument-error 'flhypot "flonum?" 1 x y))
+  (hypot-foreign x y))
 
 (define (fxquotient n d) (#2%fxquotient n d))
 
